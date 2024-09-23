@@ -21,8 +21,14 @@ char get_ascii_char(int r, int g, int b) {
 void get_terminal_size(int *rows, int *cols) {
     struct winsize w;
     ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
-    *rows = w.ws_row;
+    *rows = w.ws_row - 2;   // Subtract 2 for the prompt and status bar
     *cols = w.ws_col;
+}
+
+// Function to print colored ASCII characters using ANSI escape codes with a black background
+void print_colored_char(char ascii_char, int r, int g, int b) {
+    // Print the ASCII character in the RGB color with a black background using ANSI escape codes
+    printf("\033[48;2;0;0;0m\033[38;2;%d;%d;%dm%c", r, g, b, ascii_char);  // Black background, colored foreground
 }
 
 int main(int argc, char *argv[]) {
@@ -83,7 +89,7 @@ int main(int argc, char *argv[]) {
     float x_scale = (float)width / target_width;
     float y_scale = (float)height / target_height;
 
-    // Render the ASCII art directly to the terminal
+    // Render the colored ASCII art directly to the terminal
     for (int y = 0; y < target_height; y++) {
         for (int x = 0; x < target_width; x++) {
             // Scale the coordinates to match the original image size
@@ -96,11 +102,13 @@ int main(int argc, char *argv[]) {
             int g = img[index + 1];
             int b = img[index + 2];
 
-            // Map the pixel to an ASCII character and print it
+            // Map the pixel to an ASCII character
             char ascii_char = get_ascii_char(r, g, b);
-            printf("%c", ascii_char);
+
+            // Print the ASCII character in the pixel's color with a black background
+            print_colored_char(ascii_char, r, g, b);
         }
-        printf("\n");
+        printf("\033[0m\n");  // Reset color and background at the end of each line
     }
 
     // Calculate aspect ratios
