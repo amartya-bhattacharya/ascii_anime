@@ -3,32 +3,119 @@
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <termios.h>
+#include <fcntl.h>
 
-// ASCII character set used for grayscale mapping (inverted for proper brightness mapping)
 const char *ASCII_CHARS = " .:-=+*#%@";
-int ascii_map_size = 10;  // Number of ASCII characters
+int ascii_map_size = 10;
+static volatile bool resized = false;
+const int debug_lines = 3;  // Adjust this to match the number of extra lines you print after the image
+
+
+// Function to handle the terminal resize event
+void handle_resize(int sig) {
+    resized = true;  // Set a flag to indicate the terminal has resized
+}
 
 // Function to map pixel intensity to an ASCII character
 char get_ascii_char(int r, int g, int b) {
-    // Convert RGB to grayscale using weighted average
     int gray = 0.299 * r + 0.587 * g + 0.114 * b;
-    // Inverted grayscale mapping: @ for bright, space for black
-    if (gray == 0) return ' ';  // Map pure black (RGB 0,0,0) to space
+    if (gray == 0) return ' ';
     return ASCII_CHARS[(gray * (ascii_map_size - 1)) / 255];
 }
 
 // Function to get terminal size
 void get_terminal_size(int *rows, int *cols) {
     struct winsize w;
-    ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
-    *rows = w.ws_row - 2;   // Subtract 2 for the prompt and status bar
+    ioctl(STDIN_FILENO, TIOCGWINSZ, &w);
+    *rows = w.ws_row;
     *cols = w.ws_col;
 }
 
-// Function to print colored ASCII characters using ANSI escape codes with a black background
+// Function to print colored ASCII characters with a black background
 void print_colored_char(char ascii_char, int r, int g, int b) {
-    // Print the ASCII character in the RGB color with a black background using ANSI escape codes
-    printf("\033[48;2;0;0;0m\033[38;2;%d;%d;%dm%c", r, g, b, ascii_char);  // Black background, colored foreground
+    printf("\033[48;2;0;0;0m\033[38;2;%d;%d;%dm%c", r, g, b, ascii_char);
+}
+
+// Function to clear the terminal
+void clear_terminal() {
+    printf("\033[2J\033[H");  // Clear the terminal and move the cursor to the top
+}
+
+// Function to render the image as ASCII art in the terminal
+void render_ascii_art(unsigned char *img, int img_width, int img_height, int term_rows, int term_cols) {
+    float char_aspect_ratio = 2.0;
+    int target_width, target_height;
+
+    // Adjust terminal height to account for debug information and avoid scrolling
+    term_rows -= debug_lines;
+
+    float img_aspect_ratio = (float)img_width / img_height;
+
+    if (img_width > img_height) {
+        target_width = term_cols;
+        target_height = target_width / img_aspect_ratio / char_aspect_ratio;
+        if (target_height > term_rows) {
+            target_height = term_rows;
+            target_width = target_height * img_aspect_ratio * char_aspect_ratio;
+        }
+    } else {
+        target_height = term_rows;
+        target_width = target_height * img_aspect_ratio * char_aspect_ratio;
+        if (target_width > term_cols) {
+            target_width = term_cols;
+            target_height = target_width / img_aspect_ratio / char_aspect_ratio;
+        }
+    }
+
+    // Clear the terminal for re-drawing
+    clear_terminal();
+
+    // Clear the terminal for re-drawing
+//    printf("\033[2J\033[H");
+
+    for (int y = 0; y < target_height; y++) {
+        for (int x = 0; x < target_width; x++) {
+            int img_x = x * img_width / target_width;
+            int img_y = y * img_height / target_height;
+
+            int index = (img_y * img_width + img_x) * 3;
+            int r = img[index];
+            int g = img[index + 1];
+            int b = img[index + 2];
+
+            char ascii_char = get_ascii_char(r, g, b);
+            print_colored_char(ascii_char, r, g, b);
+        }
+        printf("\033[0m\n");  // Reset color after each line
+    }
+
+    float original_ar = (float)img_width / img_height;
+    float new_ar = (float)target_width / target_height;
+    float term_ar = (float)term_cols / term_rows;
+
+    printf("\nOriginal: %dx%d (AR: %.2f) | New: %dx%d (AR: %.2f) | Term: %dx%d (AR: %.2f)\n",
+           img_width, img_height, original_ar, target_width, target_height, new_ar, term_cols, term_rows, term_ar);
+}
+
+// Function to configure terminal to non-blocking input with proper signal handling
+void set_nonblocking_input() {
+    struct termios tty;
+    tcgetattr(STDIN_FILENO, &tty);
+    tty.c_lflag &= ~(ICANON | ECHO);  // Disable canonical mode and echo
+    tty.c_cc[VMIN] = 0;  // Minimum number of characters for non-blocking
+    tty.c_cc[VTIME] = 1;  // Timeout for non-blocking input
+    tcsetattr(STDIN_FILENO, TCSANOW, &tty);
+}
+
+// Function to reset terminal input mode
+void reset_input_mode() {
+    struct termios tty;
+    tcgetattr(STDIN_FILENO, &tty);
+    tty.c_lflag |= ICANON | ECHO;  // Enable canonical mode and echo
+    tcsetattr(STDIN_FILENO, TCSANOW, &tty);
 }
 
 int main(int argc, char *argv[]) {
@@ -38,90 +125,52 @@ int main(int argc, char *argv[]) {
     }
 
     const char *filename = argv[1];
-    int width, height, channels;
+    int img_width, img_height, channels;
 
-    // Load the image using stb_image
-    unsigned char *img = stbi_load(filename, &width, &height, &channels, 3);  // Force 3 channels (RGB)
+    unsigned char *img = stbi_load(filename, &img_width, &img_height, &channels, 3);
     if (!img) {
         printf("Failed to load image: %s\n", filename);
         return 1;
     }
 
-    printf("Image loaded: %s (%dx%d)\n", filename, width, height);
+    printf("Image loaded: %s (%dx%d)\n", filename, img_width, img_height);
 
-    // Get terminal size
+    // Set up the SIGWINCH signal handler for terminal resize
+    struct sigaction sa;
+    sa.sa_handler = handle_resize;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGWINCH, &sa, NULL);
+
     int term_rows, term_cols;
     get_terminal_size(&term_rows, &term_cols);
 
-    // Adjust for character aspect ratio (2:1 height to width)
-    float char_aspect_ratio = 2.0;
+    // Initial render
+    render_ascii_art(img, img_width, img_height, term_rows, term_cols);
 
-    // Variables to store the target width and height
-    int target_width, target_height;
+    // Set the terminal to non-blocking input mode
+    set_nonblocking_input();
 
-    // Calculate aspect ratio of the image
-    float img_aspect_ratio = (float)width / height;
-
-    // Landscape orientation (width > height)
-    if (width > height) {
-        // Cap the width at terminal width
-        target_width = term_cols;
-        target_height = target_width / img_aspect_ratio / char_aspect_ratio;
-        // Ensure height does not exceed terminal height
-        if (target_height > term_rows) {
-            target_height = term_rows;
-            target_width = target_height * img_aspect_ratio * char_aspect_ratio;
+    // Main loop to handle live re-rendering on terminal resize or 'q' press
+    while (true) {
+        if (resized) {
+            get_terminal_size(&term_rows, &term_cols);
+            render_ascii_art(img, img_width, img_height, term_rows, term_cols);
+            resized = false;
         }
-    }
-    // Portrait orientation (height > width)
-    else {
-        // Cap the height at terminal height
-        target_height = term_rows;
-        target_width = target_height * img_aspect_ratio * char_aspect_ratio;
-        // Ensure width does not exceed terminal width
-        if (target_width > term_cols) {
-            target_width = term_cols;
-            target_height = target_width / img_aspect_ratio / char_aspect_ratio;
+
+        // Check if 'q' has been pressed to quit
+        char c;
+        if (read(STDIN_FILENO, &c, 1) > 0 && c == 'q') {
+            break;
         }
+
+        usleep(100000);  // Sleep for 100ms to avoid excessive CPU usage
     }
 
-    // Pre-calculate scaling factors to avoid redundant calculations
-    float x_scale = (float)width / target_width;
-    float y_scale = (float)height / target_height;
+    // Reset terminal input mode before exiting
+    reset_input_mode();
 
-    // Render the colored ASCII art directly to the terminal
-    for (int y = 0; y < target_height; y++) {
-        for (int x = 0; x < target_width; x++) {
-            // Scale the coordinates to match the original image size
-            int img_x = x * width / target_width;
-            int img_y = y * height / target_height;
-
-            // Get pixel data
-            int index = (img_y * width + img_x) * 3;
-            int r = img[index];
-            int g = img[index + 1];
-            int b = img[index + 2];
-
-            // Map the pixel to an ASCII character
-            char ascii_char = get_ascii_char(r, g, b);
-
-            // Print the ASCII character in the pixel's color with a black background
-            print_colored_char(ascii_char, r, g, b);
-        }
-        printf("\033[0m\n");  // Reset color and background at the end of each line
-    }
-
-    // Calculate aspect ratios
-    float original_ar = (float)width / height;
-    float new_ar = (float)target_width / target_height;
-    float term_ar = (float)term_cols / term_rows;
-
-    // Debug printout
-    printf("\nOriginal: %dx%d (AR: %.2f) | New: %dx%d (AR: %.2f) | Term: %dx%d (AR: %.2f)\n",
-           width, height, original_ar, target_width, target_height, new_ar, term_cols, term_rows, term_ar);
-
-    // Free the image memory
     stbi_image_free(img);
-
     return 0;
 }
