@@ -21,17 +21,18 @@
 // stb_truetype font buffer
 unsigned char ttf_buffer[1<<20];
 stbtt_fontinfo font;
-unsigned char *font_bitmap;
 
-void init_font(const char *font_path) {
+int init_font(const char *font_path) {
     FILE *font_file = fopen(font_path, "rb");
     if (font_file) {
         fread(ttf_buffer, 1, 1 << 20, font_file);
         fclose(font_file);
         stbtt_InitFont(&font, ttf_buffer, stbtt_GetFontOffsetForIndex(ttf_buffer, 0));
     } else {
-        printf("Failed to load font: %s\n", font_path);
+        fprintf(stderr, "Error: Failed to load font file.\n");
+        return 1;
     }
+    return 0;
 }
 
 // Default ASCII character set
@@ -60,12 +61,6 @@ void handle_resize(int sig) {
     resized = true;  // Set a flag to indicate the terminal has resized
 }
 
-// Function to map pixel intensity to an ASCII character or block character
-static inline char get_ascii_char(int r, int g, int b, const char *char_set, int char_set_size) {
-    int gray = 0.299 * r + 0.587 * g + 0.114 * b;
-    return char_set[(gray * (char_set_size - 1)) / 255];
-}
-
 // Function to get terminal size
 void get_terminal_size(int *rows, int *cols) {
     struct winsize w;
@@ -88,44 +83,39 @@ void clear_terminal() {
 // Modify print function to move cursor back to the beginning instead of clearing
 void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_height, int term_rows, int term_cols, const char *char_set, int char_set_size) {
     float char_aspect_ratio = 2.0;
-    int target_width, target_height;
 
+    // Precompute scaled dimensions once and reuse in loops
     term_rows -= debug_lines;
     float img_aspect_ratio = (float)img_width / img_height;
 
-    if (img_width > img_height) {
-        target_width = term_cols;
-        target_height = target_width / img_aspect_ratio / char_aspect_ratio;
-        if (target_height > term_rows) {
-            target_height = term_rows;
-            target_width = target_height * img_aspect_ratio * char_aspect_ratio;
-        }
-    } else {
+    int target_width = term_cols;
+    int target_height = target_width / img_aspect_ratio / char_aspect_ratio;
+    if (target_height > term_rows) {
         target_height = term_rows;
         target_width = target_height * img_aspect_ratio * char_aspect_ratio;
-        if (target_width > term_cols) {
-            target_width = term_cols;
-            target_height = target_width / img_aspect_ratio / char_aspect_ratio;
-        }
     }
 
     // Clear terminal and move the cursor to the top before every render
     clear_terminal();
-    printf("\033[H");  // Move cursor to the top before starting rendering
+    printf("\033[H");
 
+    // Use the precomputed grayscale value from CachedPixel
     for (int y = 0; y < target_height; y++) {
         for (int x = 0; x < target_width; x++) {
             int img_x = x * img_width / target_width;
             int img_y = y * img_height / target_height;
 
             CachedPixel pixel = cached_img[img_y * img_width + img_x];
-            char ascii_char = get_ascii_char(pixel.r, pixel.g, pixel.b, char_set, char_set_size);
+
+            // Use precomputed grayscale value instead of calling get_ascii_char
+            int gray = pixel.gray_value;
+            char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
             print_colored_char(ascii_char, pixel.r, pixel.g, pixel.b);
         }
         printf("\033[0m\n");  // Reset color after each line
     }
 
-    // Print the debug information at the bottom
+    // Print debug info
     float original_ar = (float)img_width / img_height;
     float new_ar = (float)target_width / target_height;
     float term_ar = (float)term_cols / term_rows;
@@ -135,11 +125,11 @@ void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_h
     fflush(stdout);
 }
 
-// Function to render ASCII characters using stb_truetype
-void render_ascii_to_image(unsigned char *output_img, int x, int y, char ascii_char, int img_width, int img_height, int scale, int r, int g, int b) {
-    int width, height, x_offset, y_offset;
-    float scale_factor = stbtt_ScaleForPixelHeight(&font, scale);
 
+// Helper function to render ASCII characters using stb_truetype
+void render_ascii_to_image(unsigned char *output_img, int x, int y, char ascii_char, int img_width, int img_height, int r, int g, int b) {
+    int width, height, x_offset, y_offset;
+    float scale_factor = stbtt_ScaleForPixelHeight(&font, FONT_SIZE);
     unsigned char *bitmap = stbtt_GetCodepointBitmap(&font, 0, scale_factor, ascii_char, &width, &height, &x_offset, &y_offset);
 
     // Render the ASCII character with the foreground color (r, g, b) on a black background
@@ -164,15 +154,14 @@ void render_ascii_to_image(unsigned char *output_img, int x, int y, char ascii_c
 }
 
 // Function to render ASCII art to a PNG file with scaling, black background, and colored ASCII characters
-void render_ascii_art_file_scaled(unsigned char *img, int img_width, int img_height, const char *char_set, int char_set_size, const char *output_file, float scale_factor, int font_scale) {
-    // Calculate scaled dimensions while keeping the aspect ratio correct
+void render_ascii_art_file_scaled(CachedPixel *cached_img, int img_width, int img_height, const char *char_set, int char_set_size, const char *output_file, float scale_factor, int font_scale) {
+    // Precompute scaled dimensions once and reuse in loops
     int scaled_width = (int)(img_width * scale_factor);
     int scaled_height = (int)(img_height * scale_factor);
 
     // Allocate memory for the output image (RGBA)
     size_t output_size = scaled_width * scaled_height * 4;
     unsigned char *output_img = (unsigned char *)malloc(output_size);
-
     if (!output_img) {
         printf("Failed to allocate memory for output image.\n");
         return;
@@ -180,9 +169,9 @@ void render_ascii_art_file_scaled(unsigned char *img, int img_width, int img_hei
 
     // Fill the entire output image with black (for background)
     for (size_t i = 0; i < output_size; i += 4) {
-        output_img[i] = 0;      // Red
-        output_img[i + 1] = 0;  // Green
-        output_img[i + 2] = 0;  // Blue
+        output_img[i] = 0;     // Red
+        output_img[i + 1] = 0; // Green
+        output_img[i + 2] = 0; // Blue
         output_img[i + 3] = 255; // Alpha (fully opaque)
     }
 
@@ -194,15 +183,19 @@ void render_ascii_art_file_scaled(unsigned char *img, int img_width, int img_hei
 
             // Ensure that we're still within bounds of the input image
             if (img_x < img_width && img_y < img_height) {
-                int index = (img_y * img_width + img_x) * 3;
-                int r = img[index];
-                int g = img[index + 1];
-                int b = img[index + 2];
+                CachedPixel pixel = cached_img[img_y * img_width + img_x];
+                int r = pixel.r;
+                int g = pixel.g;
+                int b = pixel.b;
 
-                char ascii_char = get_ascii_char(r, g, b, char_set, char_set_size);
+                // Use precomputed grayscale value from CachedPixel
+                int gray = pixel.gray_value;
 
                 // Render the ASCII character at the correct position
-                render_ascii_to_image(output_img, x, y, ascii_char, scaled_width, scaled_height, font_scale, r, g, b);
+                char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
+                if (ascii_char != ' ') {
+                    render_ascii_to_image(output_img, x, y, ascii_char, scaled_width, scaled_height, r, g, b);
+                }
             }
         }
     }
@@ -212,6 +205,51 @@ void render_ascii_art_file_scaled(unsigned char *img, int img_width, int img_hei
 
     free(output_img);
 }
+
+void render_ascii_art_file_txt(CachedPixel *cached_img, int img_width, int img_height, const char *char_set, int char_set_size, const char *output_file, int term_rows, int term_cols) {
+    float char_aspect_ratio = 2.0;
+
+    // Adjust terminal height to account for debug information
+    term_rows -= debug_lines;
+    float img_aspect_ratio = (float)img_width / img_height;
+
+    int target_width = term_cols;
+    int target_height = target_width / img_aspect_ratio / char_aspect_ratio;
+    if (target_height > term_rows) {
+        target_height = term_rows;
+        target_width = target_height * img_aspect_ratio * char_aspect_ratio;
+    }
+
+    // Open the output file for writing
+    FILE *file = fopen(output_file, "w");
+    if (!file) {
+        printf("Failed to create output file: %s\n", output_file);
+        return;
+    }
+
+    // Write the ASCII art to the text file using the same logic as terminal rendering
+    for (int y = 0; y < target_height; y++) {
+        for (int x = 0; x < target_width; x++) {
+            int img_x = x * img_width / target_width;
+            int img_y = y * img_height / target_height;
+
+            CachedPixel pixel = cached_img[img_y * img_width + img_x];
+
+            // Use precomputed grayscale value from CachedPixel
+            int gray = pixel.gray_value;
+            char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
+
+            // Write the ASCII character to the file
+            fputc(ascii_char, file);
+        }
+        fputc('\n', file);  // Newline after each row
+    }
+
+    fclose(file);
+    printf("ASCII art saved to text file: %s\n", output_file);
+}
+
+
 
 // Function to initialize the cached pixel array
 CachedPixel* cache_grayscale_values(unsigned char *img, int img_width, int img_height) {
@@ -253,25 +291,23 @@ void reset_input_mode() {
 }
 
 // Function to generate the output filename by appending "-ascii.png" to the input filename
-void generate_output_filename(const char *input_filename, char *output_filename) {
-    // Find the position of the last dot (.) in the input filename
-    const char *dot = strrchr(input_filename, '.');
-    size_t len = dot ? (size_t)(dot - input_filename) : strlen(input_filename);
-
-    // Copy the base input filename into the output filename and append "-ascii.png"
-    strncpy(output_filename, input_filename, len);
-    strcpy(output_filename + len, "-ascii.png");
+void generate_output_filename(const char *input_filename, char *output_filename, const char *extension) {
+    // Copy the input filename up to (but not including) the last dot if it exists
+    snprintf(output_filename, 256, "%.*s-ascii.%s",
+             (int)(strrchr(input_filename, '.') ? strrchr(input_filename, '.') - input_filename : strlen(input_filename)),
+             input_filename, extension);
 }
 
 void print_memory_usage() {
     struct rusage usage;
     getrusage(RUSAGE_SELF, &usage);
-//    printf("Memory usage: %ld KB\n", usage.ru_maxrss);  // Outputs in kilobytes
-    // output size in megabytes
-     printf("Memory usage: %ld MB\n", usage.ru_maxrss / 1024);
+    printf("Memory usage: %ld MB\n", usage.ru_maxrss / 1024);
 }
 
 int main(int argc, char *argv[]) {
+    CachedPixel *cached_img = NULL;
+    unsigned char *img = NULL;
+
     if (argc < 2) {
         printf("Usage: %s <image file>\n", argv[0]);
         return 1;
@@ -279,20 +315,21 @@ int main(int argc, char *argv[]) {
 
     const char *filename = argv[1];
     int img_width, img_height, channels;
-    clock_t start_time = clock();
-    unsigned char *img = stbi_load(filename, &img_width, &img_height, &channels, 3);
+
+    // Load the image
+    img = stbi_load(filename, &img_width, &img_height, &channels, 3);
     if (!img) {
-        printf("Failed to load image: %s\n", filename);
+        fprintf(stderr, "Error: Failed to load image: %s\n", filename);
         return 1;
     }
 
-//    printf("Image loaded: %s (%dx%d)\n", filename, img_width, img_height);
-
-    clock_t end_time = clock();
-    double load_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
-    printf("Image loaded in %.2f seconds\n", load_time);
-
-    print_memory_usage();
+    // Initialize cached pixel array
+    cached_img = cache_grayscale_values(img, img_width, img_height);
+    if (!cached_img) {
+        fprintf(stderr, "Error: Failed to cache grayscale values.\n");
+        stbi_image_free(img);
+        return 1;
+    }
 
     // Let user choose character set for rendering
     int choice;
@@ -319,40 +356,44 @@ int main(int argc, char *argv[]) {
         case 3:
             char_set = BLOCK_CHARS;
             char_set_size = block_map_size;
-            is_block = true;  // Mark as using block characters
+//            is_block = true;  // Mark as using block characters
             break;
         default:
-            printf("Invalid choice, using default ASCII set.\n");
-            char_set = ASCII_CHARS_DEFAULT;
-            char_set_size = ascii_map_size_default;
-            break;
+            fprintf(stderr, "Error: Invalid choice for character set.\n");
+            free(cached_img);
+            stbi_image_free(img);
+            return 1;
     }
 
     // Let user choose output mode
+    int output_mode;
     printf("Choose output mode:\n");
     printf("1. Terminal\n");
-    printf("2. File\n");
-    printf("Enter your choice (1/2): ");
-    int output_mode;
+    printf("2. PNG\n");
+    printf("3. TXT\n");
+    printf("Enter your choice (1/2/3): ");
     scanf("%d", &output_mode);
 
-    // Set up the SIGWINCH signal handler for terminal resize
-    struct sigaction sa;
-    sa.sa_handler = handle_resize;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGWINCH, &sa, NULL);
-
-    int term_rows, term_cols;
-    get_terminal_size(&term_rows, &term_cols);
-
-    // Initialize cached pixel array
-    CachedPixel* cached_img = cache_grayscale_values(img, img_width, img_height);
+    if (output_mode != 1 && output_mode != 2 && output_mode != 3) {
+        fprintf(stderr, "Error: Invalid output mode. Must be 1, 2, or 3.\n");
+        return 1;
+    }
 
     if (output_mode == 1) { // Terminal output mode
         // Prepare terminal
+        int term_rows, term_cols;
+        get_terminal_size(&term_rows, &term_cols);
         clear_terminal();
+
+        // Initial render
         render_ascii_art_terminal(cached_img, img_width, img_height, term_rows, term_cols, char_set, char_set_size);
+
+        // Set up for resizing
+        struct sigaction sa;
+        sa.sa_handler = handle_resize;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGWINCH, &sa, NULL);
         set_nonblocking_input();
 
         // Main loop to handle live re-rendering on terminal resize or 'q' press
@@ -376,32 +417,50 @@ int main(int argc, char *argv[]) {
         print_memory_usage();
     } else if (output_mode == 2) {  // File output mode
         // Profiling
-        start_time = clock();
+        clock_t start_time = clock();
 
+        // Generate the output filename
         char output_filename[256];
-        generate_output_filename(filename, output_filename);
+        generate_output_filename(filename, output_filename, "png");
+
+        // Load the font
+        init_font(FONT_PATH);
 
         // Let user choose scaling factor
         float scale_factor;
         printf("Enter a scale factor (e.g., 0.5 for half size, 1 for original size, 2 for double size): ");
         scanf("%f", &scale_factor);
 
-        // Load the font
-        init_font(FONT_PATH);
+        if (scale_factor <= 0) {
+            fprintf(stderr, "Error: Invalid scale factor. Must be greater than 0.\n");
+            free(cached_img);
+            stbi_image_free(img);
+            return 1;
+        }
 
-        render_ascii_art_file_scaled(img, img_width, img_height, char_set, char_set_size, output_filename, scale_factor, FONT_SIZE);
+        render_ascii_art_file_scaled(cached_img, img_width, img_height, char_set, char_set_size, output_filename, scale_factor, FONT_SIZE);
 
         // Profiling
-        end_time = clock();
+        clock_t end_time = clock();
         double file_render_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
         printf("File render time: %.2f seconds\n", file_render_time);
         printf("ASCII art saved to file: %s\n", output_filename);
         print_memory_usage();
+    } else if (output_mode == 3) {
+        char output_filename[256];
+        generate_output_filename(filename, output_filename, "txt");
+
+        int term_rows = 0;
+        int term_cols = 0;
+        get_terminal_size(&term_rows, &term_cols);
+
+    render_ascii_art_file_txt(cached_img, img_width, img_height, char_set, char_set_size, output_filename, term_rows, term_cols);
+    print_memory_usage();
     }
 
     // Free memory
-    stbi_image_free(img);
     free(cached_img);
+    stbi_image_free(img);
 
     return 0;
 }
