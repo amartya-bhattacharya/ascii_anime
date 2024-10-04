@@ -1,9 +1,14 @@
 ascii image generator demo
 
-barebones version
+options for default or extended ASCII set. block chars WIP.
+options to render directly to terminal, or output to a png/txt file. Output saved as <input>-ascii.png/.txt.
 
-run ascii_render <image file>
+Build executable:
+cmake -S . -B cmake-build-debug
+cmake --build cmake-build-debug
 
-eg. ascii_render <ghost.jpg> or ascii_render<test_img.png>
+Run:
+cmake-build-debug/anime_to_ascii <input image>
 
-play around with terminal window scaling
+Press 'q' to quit.
+
