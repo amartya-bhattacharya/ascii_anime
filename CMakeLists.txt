@@ -3,26 +3,26 @@ project(anime_to_ascii C)
 
 set(CMAKE_C_STANDARD 11)
 
-# Add include directories for FFmpeg
+# Add FFmpeg include directory (assuming FFmpeg is installed in /usr/local)
 include_directories(/usr/local/include)
 
-# Add the executable
-add_executable(anime_to_ascii main.c)
-
-# Set FFmpeg library paths
-set(FFMPEG_LIB_DIR /usr/local/lib)
-set(FFMPEG_INCLUDE_DIR /usr/local/include)
-
-include_directories(${FFMPEG_INCLUDE_DIR})
-
-# Link FFmpeg libraries
-target_link_libraries(anime_to_ascii
-    ${FFMPEG_LIB_DIR}/libavcodec.dylib
-    ${FFMPEG_LIB_DIR}/libavformat.dylib
-    ${FFMPEG_LIB_DIR}/libavutil.dylib
-    ${FFMPEG_LIB_DIR}/libswscale.dylib
+# Find the FFmpeg packages using pkg-config if available
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat
+    libavcodec
+    libavutil
+    libswscale
+    libavdevice
 )
 
-# Include stb_image_write header
-target_include_directories(anime_to_ascii PRIVATE ${CMAKE_SOURCE_DIR})
+# Add the executable target
+add_executable(anime_to_ascii main.c)
 
+# Link FFmpeg libraries to the target
+target_link_libraries(anime_to_ascii
+    PkgConfig::FFMPEG
+)
+
+# Set rpath so that the linked FFmpeg libraries can be found at runtime
+set_target_properties(anime_to_ascii PROPERTIES INSTALL_RPATH "/usr/local/lib")
