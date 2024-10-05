@@ -39,7 +39,6 @@ typedef struct {
 
 void get_terminal_size(int *rows, int *cols);
 CachedPixel* cache_grayscale_values(unsigned char *img, int img_width, int img_height);
-void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_height, int term_rows, int term_cols, const char *char_set, int char_set_size);
 
 // Default ASCII character set
 const char *ASCII_CHARS_DEFAULT = " .:-=+*#%@";
@@ -68,22 +67,42 @@ FrameBuffer frame_buffer[FRAME_BUFFER_SIZE];
 int buffer_write_index = 0;
 int buffer_read_index = 0;
 
+// Struct for passing arguments to the producer thread
+typedef struct {
+    AVFormatContext *pFormatContext;
+    AVCodecContext *pCodecContext;
+    int video_stream_index;
+} ProducerArgs;
+
+// Struct for passing arguments to the consumer thread
+typedef struct {
+    int pCodecContext_width;
+    int pCodecContext_height;
+    double fps;
+} ConsumerArgs;
+
+typedef struct {
+    double fps;         // Frames per second (for video)
+    double frame_delay; // Frame delay in milliseconds
+    bool is_video;      // Flag indicating if rendering is for a video
+} RenderContext;
+
+
 // Synchronization primitives
 pthread_mutex_t buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t buffer_cond = PTHREAD_COND_INITIALIZER;
 
 // Flags for thread control
 volatile bool is_running = true;
-
+volatile bool is_done = false; // Added to indicate that producer is done
 
 // Function to get a formatted timestamp
 void print_timestamp(const char *message) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    printf("[%ld.%06ld] %s\n", tv.tv_sec, tv.tv_usec, message);
+    printf("[%ld.%06d] %s\n", tv.tv_sec, tv.tv_usec, message);
     fflush(stdout);
 }
-
 
 int init_font(const char *font_path) {
     print_timestamp("Initializing font...");
@@ -99,13 +118,23 @@ int init_font(const char *font_path) {
     return 0;
 }
 
-// Initialize FFmpeg and open the input video file
-void initialize_ffmpeg(const char *filename, AVFormatContext **pFormatContext, AVCodecContext **pCodecContext, int *video_stream_index) {
+int initialize_ffmpeg(const char *filename, AVFormatContext **pFormatContext, AVCodecContext **pCodecContext, int *video_stream_index) {
+    // Initialize FFmpeg and open the input video file
+    avformat_network_init();
     print_timestamp("Initializing FFmpeg...");
-    avformat_open_input(pFormatContext, filename, NULL, NULL);
-    avformat_find_stream_info(*pFormatContext, NULL);
 
-    *video_stream_index = -1;
+    if (avformat_open_input(pFormatContext, filename, NULL, NULL) != 0) {
+        fprintf(stderr, "Could not open video file: %s\n", filename);
+        return -1;
+    }
+
+    if (avformat_find_stream_info(*pFormatContext, NULL) < 0) {
+        fprintf(stderr, "Could not find stream information.\n");
+        avformat_close_input(pFormatContext);
+        return -1;
+    }
+
+    // Find the video stream
     for (int i = 0; i < (*pFormatContext)->nb_streams; i++) {
         if ((*pFormatContext)->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             *video_stream_index = i;
@@ -114,158 +143,42 @@ void initialize_ffmpeg(const char *filename, AVFormatContext **pFormatContext, A
     }
 
     if (*video_stream_index == -1) {
-        printf("No video stream found\n");
-        return;
+        fprintf(stderr, "Failed to find video stream.\n");
+        avformat_close_input(pFormatContext);
+        return -1;
     }
 
+    // Find and set up the codec context
     AVCodecParameters *codec_params = (*pFormatContext)->streams[*video_stream_index]->codecpar;
-    AVCodec *codec = (AVCodec *)avcodec_find_decoder(codec_params->codec_id);
-
+    AVCodec *codec = avcodec_find_decoder(codec_params->codec_id);
     if (!codec) {
-        printf("Failed to find codec\n");
-        return;
+        fprintf(stderr, "Failed to find codec.\n");
+        avformat_close_input(pFormatContext);
+        return -1;
     }
 
     *pCodecContext = avcodec_alloc_context3(codec);
     if (!*pCodecContext) {
-        printf("Failed to allocate codec context\n");
-        return;
+        fprintf(stderr, "Failed to allocate codec context.\n");
+        avformat_close_input(pFormatContext);
+        return -1;
     }
 
     if (avcodec_parameters_to_context(*pCodecContext, codec_params) < 0) {
-        printf("Failed to copy codec parameters to context\n");
-        return;
+        fprintf(stderr, "Failed to copy codec parameters to context.\n");
+        avcodec_free_context(pCodecContext);
+        avformat_close_input(pFormatContext);
+        return -1;
     }
 
     if (avcodec_open2(*pCodecContext, codec, NULL) < 0) {
-        printf("Failed to open codec\n");
-        return;
-    }
-}
-
-// Producer thread function: Decodes and buffers frames
-void *frame_producer(void *args) {
-    print_timestamp("Frame producer started.");
-    AVFormatContext *pFormatContext = ((AVFormatContext **)args)[0];
-    AVCodecContext *pCodecContext = ((AVCodecContext **)args)[1];
-    int video_stream_index = *((int *)args + 2);
-
-    struct SwsContext *sws_ctx = sws_getContext(
-        pCodecContext->width, pCodecContext->height, pCodecContext->pix_fmt,
-        pCodecContext->width, pCodecContext->height, AV_PIX_FMT_RGB24,
-        SWS_BILINEAR, NULL, NULL, NULL
-    );
-
-    if (!sws_ctx) {
-        fprintf(stderr, "Failed to initialize the SWS context\n");
-        return NULL;
+        fprintf(stderr, "Failed to open codec.\n");
+        avcodec_free_context(pCodecContext);
+        avformat_close_input(pFormatContext);
+        return -1;
     }
 
-    AVPacket *packet = av_packet_alloc();
-    if (!packet) {
-        fprintf(stderr, "Failed to allocate packet\n");
-        return NULL;
-    }
-
-    while (is_running && av_read_frame(pFormatContext, packet) >= 0) {
-        if (packet->stream_index == video_stream_index) {
-            if (avcodec_send_packet(pCodecContext, packet) == 0) {
-                AVFrame *frame = av_frame_alloc();
-                if (!frame) {
-                    fprintf(stderr, "Failed to allocate memory for frame\n");
-                    continue;
-                }
-
-                if (avcodec_receive_frame(pCodecContext, frame) == 0) {
-                    print_timestamp("Frame decoded successfully.");
-                    // Convert the frame to RGB
-                    AVFrame *rgb_frame = av_frame_alloc();
-                    uint8_t *buffer = (uint8_t *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32));
-                    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
-
-                    sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, pCodecContext->height, rgb_frame->data, rgb_frame->linesize);
-
-                    // Lock the buffer and write frame to it
-                    pthread_mutex_lock(&buffer_mutex);
-                    print_timestamp("Producer: Waiting for an empty buffer slot...");
-
-                    while (frame_buffer[buffer_write_index].is_ready) {
-                        pthread_cond_wait(&buffer_cond, &buffer_mutex);
-                    }
-
-                    print_timestamp("Producer: Writing frame to buffer.");
-
-                    // Cache the grayscale values and set frame as ready
-                    frame_buffer[buffer_write_index].cached_img = cache_grayscale_values(rgb_frame->data[0], pCodecContext->width, pCodecContext->height);
-                    frame_buffer[buffer_write_index].frame = frame;
-                    frame_buffer[buffer_write_index].is_ready = 1;
-
-                    buffer_write_index = (buffer_write_index + 1) % FRAME_BUFFER_SIZE;
-
-                    pthread_cond_signal(&buffer_cond);
-                    pthread_mutex_unlock(&buffer_mutex);
-
-                    av_frame_free(&rgb_frame);
-                    av_free(buffer);
-                } else {
-                    av_frame_free(&frame);
-                }
-            }
-        }
-        av_packet_unref(packet);
-    }
-
-    av_packet_free(&packet);
-    sws_freeContext(sws_ctx);
-    print_timestamp("Frame producer finished.");
-    return NULL;
-}
-
-// Consumer thread function: Renders frames to terminal
-void *frame_consumer(void *args) {
-    print_timestamp("Frame consumer started.");
-    int pCodecContext_width = ((int *)args)[0];
-    int pCodecContext_height = ((int *)args)[1];
-    double fps = *((double *)args + 2);
-
-    struct timespec start_time, current_time;
-
-    while (is_running) {
-        pthread_mutex_lock(&buffer_mutex);
-        print_timestamp("Consumer: Waiting for a ready frame...");
-        while (!frame_buffer[buffer_read_index].is_ready) {
-            pthread_cond_wait(&buffer_cond, &buffer_mutex);
-        }
-
-        print_timestamp("Consumer: Rendering frame.");
-
-        // Get the frame from the buffer
-        CachedPixel *cached_img = frame_buffer[buffer_read_index].cached_img;
-        int term_rows, term_cols;
-        get_terminal_size(&term_rows, &term_cols);
-
-        // Render the frame
-        clock_gettime(CLOCK_MONOTONIC, &start_time);
-        render_ascii_art_terminal(cached_img, pCodecContext_width, pCodecContext_height, term_rows, term_cols, ASCII_CHARS_DEFAULT, ascii_map_size_default);
-
-        // Calculate real-time FPS
-        clock_gettime(CLOCK_MONOTONIC, &current_time);
-        double elapsed_time_ms = (current_time.tv_sec - start_time.tv_sec) * 1000.0 + (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
-        double delay_ms = (1000.0 / fps) - elapsed_time_ms;
-
-        if (delay_ms > 0) {
-            usleep(delay_ms * 1000);
-        }
-
-        // Mark frame as consumed and move to the next one
-        frame_buffer[buffer_read_index].is_ready = 0;
-        buffer_read_index = (buffer_read_index + 1) % FRAME_BUFFER_SIZE;
-
-        pthread_cond_signal(&buffer_cond);
-        pthread_mutex_unlock(&buffer_mutex);
-    }
-    print_timestamp("Frame consumer finished.");
-    return NULL;
+    return 0;  // Successful initialization
 }
 
 static volatile bool resized = false;
@@ -317,53 +230,10 @@ CachedPixel* cache_grayscale_values(unsigned char *img, int img_width, int img_h
 }
 
 // Modify print function to move cursor back to the beginning instead of clearing
-//void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_height, int term_rows, int term_cols, const char *char_set, int char_set_size) {
-//    float char_aspect_ratio = 2.0;
-//
-//    // Precompute scaled dimensions once and reuse in loops
-//    term_rows -= debug_lines;
-//    float img_aspect_ratio = (float)img_width / img_height;
-//
-//    int target_width = term_cols;
-//    int target_height = target_width / img_aspect_ratio / char_aspect_ratio;
-//    if (target_height > term_rows) {
-//        target_height = term_rows;
-//        target_width = target_height * img_aspect_ratio * char_aspect_ratio;
-//    }
-//
-//    // Clear terminal and move the cursor to the top before every render
-//    clear_terminal();
-//    printf("\033[H");
-//
-//    // Use the precomputed grayscale value from CachedPixel
-//    for (int y = 0; y < target_height; y++) {
-//        for (int x = 0; x < target_width; x++) {
-//            int img_x = x * img_width / target_width;
-//            int img_y = y * img_height / target_height;
-//
-//            CachedPixel pixel = cached_img[img_y * img_width + img_x];
-//
-//            // Use precomputed grayscale value instead of calling get_ascii_char
-//            int gray = pixel.gray_value;
-//            char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
-//            print_colored_char(ascii_char, pixel.r, pixel.g, pixel.b);
-//        }
-//        printf("\033[0m\n");  // Reset color after each line
-//    }
-//
-//    // Print debug info
-//    float original_ar = (float)img_width / img_height;
-//    float new_ar = (float)target_width / target_height;
-//    float term_ar = (float)term_cols / term_rows;
-//
-//    printf("\nOriginal: %dx%d (AR: %.2f) | New: %dx%d (AR: %.2f) | Term: %dx%d (AR: %.2f)\n",
-//           img_width, img_height, original_ar, target_width, target_height, new_ar, term_cols, term_rows + debug_lines, term_ar);
-//    fflush(stdout);
-//}
-
-// Optimized terminal rendering to avoid full clears
-void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_height, int term_rows, int term_cols, const char *char_set, int char_set_size) {
+void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_height, int term_rows, int term_cols, const char *char_set, int char_set_size, RenderContext *context) {
     float char_aspect_ratio = 2.0;
+
+    // Precompute scaled dimensions once and reuse in loops
     term_rows -= debug_lines;
     float img_aspect_ratio = (float)img_width / img_height;
 
@@ -374,26 +244,78 @@ void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_h
         target_width = target_height * img_aspect_ratio * char_aspect_ratio;
     }
 
-    printf("\033[H");  // Move cursor to the top
+    // Clear terminal and move the cursor to the top before every render
+    clear_terminal();
+    printf("\033[H");
+
+    // Use the precomputed grayscale value from CachedPixel
     for (int y = 0; y < target_height; y++) {
         for (int x = 0; x < target_width; x++) {
             int img_x = x * img_width / target_width;
             int img_y = y * img_height / target_height;
 
             CachedPixel pixel = cached_img[img_y * img_width + img_x];
+
+            // Use precomputed grayscale value instead of calling get_ascii_char
             int gray = pixel.gray_value;
             char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
             print_colored_char(ascii_char, pixel.r, pixel.g, pixel.b);
         }
-        printf("\033[0m\n");
+        printf("\033[0m\n");  // Reset color after each line
     }
 
-    // Print debugging information (aspect ratios)
+    // Print debug info
     float original_ar = (float)img_width / img_height;
     float new_ar = (float)target_width / target_height;
-    printf("\nOriginal: %dx%d (AR: %.2f) | New: %dx%d (AR: %.2f)\n", img_width, img_height, original_ar, target_width, target_height, new_ar);
+
+    if (context != NULL && context->is_video) {
+        // If rendering a video, print additional video information
+        printf("\nOriginal resolution %dx%d (AR: %.2f) | New resolution %dx%d (AR: %.2f) | FPS: %.2f | Frame Delay: %.2f ms\n",
+               img_width, img_height, original_ar, target_width, target_height, new_ar, context->fps, context->frame_delay);
+    } else {
+        // If rendering an image, print the current debug line
+        float term_ar = (float)term_cols / term_rows;
+        printf("\nOriginal: %dx%d (AR: %.2f) | New: %dx%d (AR: %.2f) | Term: %dx%d (AR: %.2f)\n",
+               img_width, img_height, original_ar, target_width, target_height, new_ar, term_cols, term_rows + debug_lines, term_ar);
+    }
+
     fflush(stdout);
 }
+
+
+// Optimized terminal rendering to avoid full clears
+//void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_height, int term_rows, int term_cols, const char *char_set, int char_set_size) {
+//    float char_aspect_ratio = 2.0;
+//    term_rows -= debug_lines;
+//    float img_aspect_ratio = (float)img_width / img_height;
+//
+//    int target_width = term_cols;
+//    int target_height = target_width / img_aspect_ratio / char_aspect_ratio;
+//    if (target_height > term_rows) {
+//        target_height = term_rows;
+//        target_width = target_height * img_aspect_ratio * char_aspect_ratio;
+//    }
+//
+//    printf("\033[H");  // Move cursor to the top
+//    for (int y = 0; y < target_height; y++) {
+//        for (int x = 0; x < target_width; x++) {
+//            int img_x = x * img_width / target_width;
+//            int img_y = y * img_height / target_height;
+//
+//            CachedPixel pixel = cached_img[img_y * img_width + img_x];
+//            int gray = pixel.gray_value;
+//            char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
+//            print_colored_char(ascii_char, pixel.r, pixel.g, pixel.b);
+//        }
+//        printf("\033[0m\n");
+//    }
+//
+//    // Print debugging information (aspect ratios)
+//    float original_ar = (float)img_width / img_height;
+//    float new_ar = (float)target_width / target_height;
+//    printf("\nOriginal: %dx%d (AR: %.2f) | New: %dx%d (AR: %.2f)\n", img_width, img_height, original_ar, target_width, target_height, new_ar);
+//    fflush(stdout);
+//}
 
 
 // Helper function to render ASCII characters using stb_truetype
@@ -519,167 +441,420 @@ void render_ascii_art_file_txt(CachedPixel *cached_img, int img_width, int img_h
     printf("ASCII art saved to text file: %s\n", output_file);
 }
 
-void render_video_to_terminal(AVFormatContext *pFormatContext, AVCodecContext *pCodecContext, int video_stream_index) {
+//void render_video_to_terminal(AVFormatContext *pFormatContext, AVCodecContext *pCodecContext, int video_stream_index) {
+//    struct SwsContext *sws_ctx = sws_getContext(
+//        pCodecContext->width, pCodecContext->height, pCodecContext->pix_fmt,
+//        pCodecContext->width, pCodecContext->height, AV_PIX_FMT_RGB24,
+//        SWS_BILINEAR, NULL, NULL, NULL
+//    );
+//    if (!sws_ctx) {
+//        fprintf(stderr, "Failed to initialize the SWS context\n");
+//        return;
+//    }
+//
+//    AVFrame *frame = av_frame_alloc();
+//    AVFrame *rgb_frame = av_frame_alloc();
+//    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
+//    uint8_t *buffer = (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t));
+//    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
+//
+//    AVPacket *packet = av_packet_alloc();
+//    if (!packet) {
+//        fprintf(stderr, "Failed to allocate memory for packet\n");
+//        return;
+//    }
+//
+//    double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
+//    printf("Original video FPS: %.2f\n", fps);
+//    fflush(stdout);
+//
+//    struct timeval start_time, current_time, frame_start;
+//    double elapsed_time = 0;
+//    gettimeofday(&start_time, NULL);
+//
+//    while (av_read_frame(pFormatContext, packet) >= 0) {
+//        if (packet->stream_index == video_stream_index) {
+//            if (avcodec_send_packet(pCodecContext, packet) == 0) {
+//                while (avcodec_receive_frame(pCodecContext, frame) == 0) {
+//                    gettimeofday(&frame_start, NULL);  // Mark start time of frame rendering
+//
+//                    sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, pCodecContext->height, rgb_frame->data, rgb_frame->linesize);
+//
+//                    CachedPixel *cached_img = cache_grayscale_values(rgb_frame->data[0], pCodecContext->width, pCodecContext->height);
+//                    int term_rows, term_cols;
+//                    get_terminal_size(&term_rows, &term_cols);
+//
+//                    render_ascii_art_terminal(cached_img, pCodecContext->width, pCodecContext->height, term_rows, term_cols, ASCII_CHARS_DEFAULT, ascii_map_size_default);
+//
+//                    free(cached_img);
+//
+//                    // Calculate elapsed time since the start of frame processing
+//                    gettimeofday(&current_time, NULL);
+//                    elapsed_time = (current_time.tv_sec - frame_start.tv_sec) * 1000.0;  // Convert to milliseconds
+//                    elapsed_time += (current_time.tv_usec - frame_start.tv_usec) / 1000.0;  // Convert microseconds to milliseconds
+//
+//                    // Calculate delay to sync with the original frame rate
+//                    double expected_frame_time = 1000.0 / fps;  // Expected time per frame in milliseconds
+//                    if (elapsed_time < expected_frame_time) {
+//                        usleep((expected_frame_time - elapsed_time) * 1000);  // Sleep to maintain FPS
+//                    }
+//                }
+//            }
+//        }
+//        av_packet_unref(packet);
+//    }
+//
+//    av_packet_free(&packet);
+//    av_frame_free(&frame);
+//    av_frame_free(&rgb_frame);
+//    av_free(buffer);
+//    sws_freeContext(sws_ctx);
+//}
+
+//void render_video_to_terminal_with_buffering(AVFormatContext *pFormatContext, AVCodecContext *pCodecContext, int video_stream_index) {
+//    // Set up SwsContext for RGB conversion
+//    struct SwsContext *sws_ctx = sws_getContext(pCodecContext->width, pCodecContext->height, pCodecContext->pix_fmt,
+//                                                pCodecContext->width, pCodecContext->height, AV_PIX_FMT_RGB24,
+//                                                SWS_BILINEAR, NULL, NULL, NULL);
+//    if (!sws_ctx) {
+//        fprintf(stderr, "Failed to initialize the SWS context\n");
+//        return;
+//    }
+//
+//    // Set up frame buffering
+//    int buffer_size = 5;
+//    AVFrame *frames[buffer_size];
+//    CachedPixel *cached_frames[buffer_size];
+//    for (int i = 0; i < buffer_size; ++i) {
+//        frames[i] = av_frame_alloc();
+//        cached_frames[i] = NULL;
+//    }
+//
+//    AVPacket *packet = av_packet_alloc();
+//    if (!packet) {
+//        fprintf(stderr, "Failed to allocate packet\n");
+//        return;
+//    }
+//
+//    double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
+//    double frame_duration_ms = 1000.0 / fps;
+//
+//    // Timing variables
+//    struct timespec start_time, current_time;
+//    clock_gettime(CLOCK_MONOTONIC, &start_time);
+//
+//    int frame_index = 0;
+//    while (av_read_frame(pFormatContext, packet) >= 0) {
+//        if (packet->stream_index == video_stream_index) {
+//            if (avcodec_send_packet(pCodecContext, packet) == 0) {
+//                while (avcodec_receive_frame(pCodecContext, frames[frame_index]) == 0) {
+//                    // Convert to RGB and cache grayscale values
+//                    AVFrame *rgb_frame = av_frame_alloc();
+//                    uint8_t *buffer = (uint8_t *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32));
+//                    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
+//                    sws_scale(sws_ctx, (uint8_t const * const *)frames[frame_index]->data, frames[frame_index]->linesize, 0, pCodecContext->height,
+//                              rgb_frame->data, rgb_frame->linesize);
+//
+//                    cached_frames[frame_index] = cache_grayscale_values(rgb_frame->data[0], pCodecContext->width, pCodecContext->height);
+//
+//                    // Update frame index for circular buffer
+//                    frame_index = (frame_index + 1) % buffer_size;
+//
+//                    // Free resources used for this frame after caching
+//                    av_frame_free(&rgb_frame);
+//                    av_free(buffer);
+//                }
+//            }
+//        }
+//
+//        av_packet_unref(packet);
+//    }
+//
+//    av_packet_free(&packet);
+//    sws_freeContext(sws_ctx);
+//
+//    // Render frames in buffer
+//    for (int i = 0; i < buffer_size; ++i) {
+//        if (cached_frames[i]) {
+//            // Render the frame from the cache
+//            int term_rows, term_cols;
+//            get_terminal_size(&term_rows, &term_cols);
+//            render_ascii_art_terminal(cached_frames[i], pCodecContext->width, pCodecContext->height, term_rows, term_cols, ASCII_CHARS_DEFAULT, ascii_map_size_default);
+//
+//            // Sleep to maintain frame rate
+////            clock_gettime(CLOCK_MONOTONIC, &current_time);
+////            double elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000.0 + (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
+////            double delay = frame_duration_ms - elapsed_ms;
+////            if (delay > 0) {
+////                usleep(delay * 1000);
+////            }
+//
+//            // Update start time for the next frame
+//            clock_gettime(CLOCK_MONOTONIC, &start_time);
+//        }
+//    }
+//
+//    // Free all cached frames
+//    for (int i = 0; i < buffer_size; ++i) {
+//        if (cached_frames[i]) {
+//            free(cached_frames[i]);
+//        }
+//        av_frame_free(&frames[i]);
+//    }
+//}
+
+void *frame_producer(void *args) {
+//    print_timestamp("Frame producer started.");
+    ProducerArgs *prod_args = (ProducerArgs *)args;
+
+    AVFormatContext *pFormatContext = prod_args->pFormatContext;
+    AVCodecContext *pCodecContext = prod_args->pCodecContext;
+    int video_stream_index = prod_args->video_stream_index;
+
     struct SwsContext *sws_ctx = sws_getContext(
         pCodecContext->width, pCodecContext->height, pCodecContext->pix_fmt,
         pCodecContext->width, pCodecContext->height, AV_PIX_FMT_RGB24,
         SWS_BILINEAR, NULL, NULL, NULL
     );
+
     if (!sws_ctx) {
-        fprintf(stderr, "Failed to initialize the SWS context\n");
-        return;
+        print_timestamp("Failed to initialize the SWS context");
+        pthread_exit(NULL);
+    }
+
+    AVPacket *packet = av_packet_alloc();
+    if (!packet) {
+        print_timestamp("Failed to allocate packet");
+        sws_freeContext(sws_ctx);
+        pthread_exit(NULL);
     }
 
     AVFrame *frame = av_frame_alloc();
-    AVFrame *rgb_frame = av_frame_alloc();
-    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
-    uint8_t *buffer = (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t));
-    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
+    if (!frame) {
+        print_timestamp("Failed to allocate frame");
+        av_packet_free(&packet);
+        sws_freeContext(sws_ctx);
+        pthread_exit(NULL);
+    }
 
-    AVPacket *packet = av_packet_alloc();
-    if (!packet) {
-        fprintf(stderr, "Failed to allocate memory for packet\n");
+    while (is_running) {
+        int ret = av_read_frame(pFormatContext, packet);
+        if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+//                print_timestamp("End of file reached");
+            } else {
+                fprintf(stderr, "Error reading frame: %s\n", av_err2str(ret));
+            }
+            break; // Exit the loop if there's an error or EOF
+        }
+
+        if (packet->stream_index == video_stream_index) {
+            ret = avcodec_send_packet(pCodecContext, packet);
+            if (ret < 0) {
+                fprintf(stderr, "Error sending packet to decoder: %s\n", av_err2str(ret));
+                av_packet_unref(packet);
+                continue;
+            }
+
+            while ((ret = avcodec_receive_frame(pCodecContext, frame)) == 0) {
+//                print_timestamp("Frame decoded successfully.");
+
+                // Convert the frame to RGB
+                AVFrame *rgb_frame = av_frame_alloc();
+                if (!rgb_frame) {
+                    print_timestamp("Failed to allocate RGB frame");
+                    av_frame_unref(frame);
+                    av_packet_unref(packet);
+                    continue;
+                }
+
+                uint8_t *buffer = (uint8_t *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32));
+                if (!buffer) {
+                    print_timestamp("Failed to allocate RGB buffer");
+                    av_frame_free(&rgb_frame);
+                    av_frame_unref(frame);
+                    av_packet_unref(packet);
+                    continue;
+                }
+
+                av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
+                sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, pCodecContext->height, rgb_frame->data, rgb_frame->linesize);
+
+                // Lock the buffer and write frame to it
+                pthread_mutex_lock(&buffer_mutex);
+//                print_timestamp("Producer: Waiting for an empty buffer slot...");
+
+                while (frame_buffer[buffer_write_index].is_ready) {
+                    pthread_cond_wait(&buffer_cond, &buffer_mutex);
+                }
+
+//                print_timestamp("Producer: Writing frame to buffer.");
+
+                frame_buffer[buffer_write_index].cached_img = cache_grayscale_values(rgb_frame->data[0], pCodecContext->width, pCodecContext->height);
+                frame_buffer[buffer_write_index].frame = av_frame_clone(frame);
+                frame_buffer[buffer_write_index].is_ready = 1;
+
+                buffer_write_index = (buffer_write_index + 1) % FRAME_BUFFER_SIZE;
+
+                pthread_cond_signal(&buffer_cond);
+                pthread_mutex_unlock(&buffer_mutex);
+
+                av_frame_free(&rgb_frame);
+                av_free(buffer);
+            }
+
+            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                fprintf(stderr, "Error receiving frame from decoder: %s\n", av_err2str(ret));
+            }
+        }
+        av_packet_unref(packet);
+    }
+
+    pthread_mutex_lock(&buffer_mutex);
+    is_done = true; // Set the flag to indicate producer is done
+    pthread_cond_broadcast(&buffer_cond); // Notify all waiting consumers
+    pthread_mutex_unlock(&buffer_mutex);
+
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    sws_freeContext(sws_ctx);
+
+//    print_timestamp("Frame producer finished.");
+    pthread_exit(NULL);
+}
+
+
+// Consumer thread function: Renders frames to terminal
+void *frame_consumer(void *args) {
+//    print_timestamp("Frame consumer started.");
+    ConsumerArgs *cons_args = (ConsumerArgs *)args;
+    int pCodecContext_width = cons_args->pCodecContext_width;
+    int pCodecContext_height = cons_args->pCodecContext_height;
+    double fps = cons_args->fps;
+
+    struct timespec start_time, current_time;
+
+    // Prepare render context for video rendering
+    double frame_delay = 1000.0 / fps;  // Frame delay in milliseconds
+    RenderContext render_context = {
+        .fps = fps,
+        .frame_delay = frame_delay,
+        .is_video = true
+    };
+
+    while (is_running) {
+        pthread_mutex_lock(&buffer_mutex);
+//        print_timestamp("Consumer: Locked buffer_mutex.");
+
+        // Wait for a ready frame or until producer indicates it's done
+        while (!frame_buffer[buffer_read_index].is_ready && !is_done) {
+//            print_timestamp("Consumer: No ready frames, waiting...");
+            pthread_cond_wait(&buffer_cond, &buffer_mutex);
+//            print_timestamp("Consumer: Woke up, checking buffer...");
+        }
+
+        if (is_done && !frame_buffer[buffer_read_index].is_ready) {
+            // Exit if no more frames to consume and producer is done
+//            print_timestamp("Consumer: No more frames, exiting...");
+            pthread_mutex_unlock(&buffer_mutex);
+            break;
+        }
+
+        // Consume the frame
+//        print_timestamp("Consumer: Consuming frame.");
+        CachedPixel *cached_img = frame_buffer[buffer_read_index].cached_img;
+
+//        printf("Consumer: Consumed frame from buffer index %d.\n", buffer_read_index);
+
+        // Render the frame to the terminal
+        int term_rows, term_cols;
+        get_terminal_size(&term_rows, &term_cols);
+        render_ascii_art_terminal(cached_img, pCodecContext_width, pCodecContext_height, term_rows, term_cols, ASCII_CHARS_DEFAULT, ascii_map_size_default, &render_context);
+
+
+        // Mark frame as consumed and update the read index
+        frame_buffer[buffer_read_index].is_ready = 0;
+        buffer_read_index = (buffer_read_index + 1) % FRAME_BUFFER_SIZE;
+
+        // Signal the producer that a slot is free in the buffer
+//        print_timestamp("Consumer: Signaling producer that buffer slot is free.");
+        pthread_cond_signal(&buffer_cond);
+
+        pthread_mutex_unlock(&buffer_mutex);
+//        print_timestamp("Consumer: Unlocked buffer_mutex.");
+
+        // Sleep to maintain the desired frame rate
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
+        double expected_frame_time = 1000.0 / fps; // milliseconds per frame
+        usleep(expected_frame_time * 1000); // Simulate frame rendering delay
+    }
+
+//    print_timestamp("Frame consumer finished.");
+    return NULL;
+}
+
+void process_video(const char *filename) {
+    AVFormatContext *pFormatContext = NULL;
+    AVCodecContext *pCodecContext = NULL;
+    int video_stream_index = -1;
+
+    // Initialize FFmpeg and open the input video file
+    if (initialize_ffmpeg(filename, &pFormatContext, &pCodecContext, &video_stream_index) != 0) {
+        // Initialization failed, exit the function
         return;
     }
 
+    // Print additional video information
+    const char *extension = strrchr(filename, '.');
+    if (!extension) extension = "unknown";
+
+    // Prepare render context for video
     double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
-    printf("Original video FPS: %.2f\n", fps);
+    double frame_delay = 1000.0 / fps;
+    RenderContext render_context = {
+        .fps = fps,
+        .frame_delay = frame_delay,
+        .is_video = true
+    };
+
+    printf("Video Extension: %s\n", extension);
+    printf("Target FPS: %.2f\n", fps);
+    printf("Frame Time (ms): %.2f\n", frame_delay);
+    printf("Input Pixel Format: %s\n", av_get_pix_fmt_name(pCodecContext->pix_fmt));
     fflush(stdout);
 
-    struct timeval start_time, current_time, frame_start;
-    double elapsed_time = 0;
-    gettimeofday(&start_time, NULL);
+    // Create producer and consumer threads
+    pthread_t producer_thread, consumer_thread;
 
-    while (av_read_frame(pFormatContext, packet) >= 0) {
-        if (packet->stream_index == video_stream_index) {
-            if (avcodec_send_packet(pCodecContext, packet) == 0) {
-                while (avcodec_receive_frame(pCodecContext, frame) == 0) {
-                    gettimeofday(&frame_start, NULL);  // Mark start time of frame rendering
+    // Prepare arguments for the producer and consumer
+    ProducerArgs producer_args = {
+        .pFormatContext = pFormatContext,
+        .pCodecContext = pCodecContext,
+        .video_stream_index = video_stream_index
+    };
 
-                    sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, pCodecContext->height, rgb_frame->data, rgb_frame->linesize);
+    ConsumerArgs consumer_args = {
+        .pCodecContext_width = pCodecContext->width,
+        .pCodecContext_height = pCodecContext->height,
+        .fps = fps
+    };
 
-                    CachedPixel *cached_img = cache_grayscale_values(rgb_frame->data[0], pCodecContext->width, pCodecContext->height);
-                    int term_rows, term_cols;
-                    get_terminal_size(&term_rows, &term_cols);
+    // Create producer and consumer threads
+    pthread_create(&producer_thread, NULL, frame_producer, &producer_args);
+    pthread_create(&consumer_thread, NULL, frame_consumer, &consumer_args);
 
-                    render_ascii_art_terminal(cached_img, pCodecContext->width, pCodecContext->height, term_rows, term_cols, ASCII_CHARS_DEFAULT, ascii_map_size_default);
+    // Wait for producer and consumer threads to finish
+    pthread_join(producer_thread, NULL);
+    pthread_join(consumer_thread, NULL);
 
-                    free(cached_img);
-
-                    // Calculate elapsed time since the start of frame processing
-                    gettimeofday(&current_time, NULL);
-                    elapsed_time = (current_time.tv_sec - frame_start.tv_sec) * 1000.0;  // Convert to milliseconds
-                    elapsed_time += (current_time.tv_usec - frame_start.tv_usec) / 1000.0;  // Convert microseconds to milliseconds
-
-                    // Calculate delay to sync with the original frame rate
-                    double expected_frame_time = 1000.0 / fps;  // Expected time per frame in milliseconds
-                    if (elapsed_time < expected_frame_time) {
-                        usleep((expected_frame_time - elapsed_time) * 1000);  // Sleep to maintain FPS
-                    }
-                }
-            }
-        }
-        av_packet_unref(packet);
-    }
-
-    av_packet_free(&packet);
-    av_frame_free(&frame);
-    av_frame_free(&rgb_frame);
-    av_free(buffer);
-    sws_freeContext(sws_ctx);
+    // Cleanup FFmpeg resources
+    avcodec_free_context(&pCodecContext);
+    avformat_close_input(&pFormatContext);
 }
 
-void render_video_to_terminal_with_buffering(AVFormatContext *pFormatContext, AVCodecContext *pCodecContext, int video_stream_index) {
-    // Set up SwsContext for RGB conversion
-    struct SwsContext *sws_ctx = sws_getContext(pCodecContext->width, pCodecContext->height, pCodecContext->pix_fmt,
-                                                pCodecContext->width, pCodecContext->height, AV_PIX_FMT_RGB24,
-                                                SWS_BILINEAR, NULL, NULL, NULL);
-    if (!sws_ctx) {
-        fprintf(stderr, "Failed to initialize the SWS context\n");
-        return;
-    }
 
-    // Set up frame buffering
-    int buffer_size = 5;
-    AVFrame *frames[buffer_size];
-    CachedPixel *cached_frames[buffer_size];
-    for (int i = 0; i < buffer_size; ++i) {
-        frames[i] = av_frame_alloc();
-        cached_frames[i] = NULL;
-    }
 
-    AVPacket *packet = av_packet_alloc();
-    if (!packet) {
-        fprintf(stderr, "Failed to allocate packet\n");
-        return;
-    }
 
-    double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
-    double frame_duration_ms = 1000.0 / fps;
-
-    // Timing variables
-    struct timespec start_time, current_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
-    int frame_index = 0;
-    while (av_read_frame(pFormatContext, packet) >= 0) {
-        if (packet->stream_index == video_stream_index) {
-            if (avcodec_send_packet(pCodecContext, packet) == 0) {
-                while (avcodec_receive_frame(pCodecContext, frames[frame_index]) == 0) {
-                    // Convert to RGB and cache grayscale values
-                    AVFrame *rgb_frame = av_frame_alloc();
-                    uint8_t *buffer = (uint8_t *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32));
-                    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
-                    sws_scale(sws_ctx, (uint8_t const * const *)frames[frame_index]->data, frames[frame_index]->linesize, 0, pCodecContext->height,
-                              rgb_frame->data, rgb_frame->linesize);
-
-                    cached_frames[frame_index] = cache_grayscale_values(rgb_frame->data[0], pCodecContext->width, pCodecContext->height);
-
-                    // Update frame index for circular buffer
-                    frame_index = (frame_index + 1) % buffer_size;
-
-                    // Free resources used for this frame after caching
-                    av_frame_free(&rgb_frame);
-                    av_free(buffer);
-                }
-            }
-        }
-
-        av_packet_unref(packet);
-    }
-
-    av_packet_free(&packet);
-    sws_freeContext(sws_ctx);
-
-    // Render frames in buffer
-    for (int i = 0; i < buffer_size; ++i) {
-        if (cached_frames[i]) {
-            // Render the frame from the cache
-            int term_rows, term_cols;
-            get_terminal_size(&term_rows, &term_cols);
-            render_ascii_art_terminal(cached_frames[i], pCodecContext->width, pCodecContext->height, term_rows, term_cols, ASCII_CHARS_DEFAULT, ascii_map_size_default);
-
-            // Sleep to maintain frame rate
-//            clock_gettime(CLOCK_MONOTONIC, &current_time);
-//            double elapsed_ms = (current_time.tv_sec - start_time.tv_sec) * 1000.0 + (current_time.tv_nsec - start_time.tv_nsec) / 1e6;
-//            double delay = frame_duration_ms - elapsed_ms;
-//            if (delay > 0) {
-//                usleep(delay * 1000);
-//            }
-
-            // Update start time for the next frame
-            clock_gettime(CLOCK_MONOTONIC, &start_time);
-        }
-    }
-
-    // Free all cached frames
-    for (int i = 0; i < buffer_size; ++i) {
-        if (cached_frames[i]) {
-            free(cached_frames[i]);
-        }
-        av_frame_free(&frames[i]);
-    }
-}
 
 
 // Function to configure terminal to non-blocking input
@@ -741,39 +916,41 @@ int main(int argc, char *argv[]) {
 
     // Check if the input is a video file
     if (is_video_file(filename)) {
-        AVFormatContext *pFormatContext = NULL;
-        AVCodecContext *pCodecContext = NULL;
-        int video_stream_index = -1;
-
-        initialize_ffmpeg(filename, &pFormatContext, &pCodecContext, &video_stream_index);
-        if (video_stream_index == -1) {
-            fprintf(stderr, "Failed to find video stream.\n");
-            return -1;
-        }
-
-        // Retrieve original frame rate from the video
-        double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
-        printf("Original video FPS: %.2f\n", fps);
-        fflush(stdout);
-
-        // Create producer and consumer threads
-        pthread_t producer_thread, consumer_thread;
-
-        void *producer_args[] = {pFormatContext, pCodecContext, &video_stream_index};
-        void *consumer_args[] = {&pCodecContext->width, &pCodecContext->height, &fps};
-
-        pthread_create(&producer_thread, NULL, frame_producer, producer_args);
-        pthread_create(&consumer_thread, NULL, frame_consumer, consumer_args);
-
-        // Join threads
-        pthread_join(producer_thread, NULL);
-        pthread_join(consumer_thread, NULL);
-
-        // Cleanup FFmpeg resources
-        avcodec_free_context(&pCodecContext);
-        avformat_close_input(&pFormatContext);
-
+        process_video(filename);  // Call the simplified video processing function
         return 0;
+//        AVFormatContext *pFormatContext = NULL;
+//        AVCodecContext *pCodecContext = NULL;
+//        int video_stream_index = -1;
+//
+//        initialize_ffmpeg(filename, &pFormatContext, &pCodecContext, &video_stream_index);
+//        if (video_stream_index == -1) {
+//            fprintf(stderr, "Failed to find video stream.\n");
+//            return -1;
+//        }
+//
+//        // Retrieve original frame rate from the video
+//        double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
+//        printf("Original video FPS: %.2f\n", fps);
+//        fflush(stdout);
+//
+//        // Create producer and consumer threads
+//        pthread_t producer_thread, consumer_thread;
+//
+//        void *producer_args[] = {pFormatContext, pCodecContext, &video_stream_index};
+//        void *consumer_args[] = {&pCodecContext->width, &pCodecContext->height, &fps};
+//
+//        pthread_create(&producer_thread, NULL, frame_producer, producer_args);
+//        pthread_create(&consumer_thread, NULL, frame_consumer, consumer_args);
+//
+//        // Join threads
+//        pthread_join(producer_thread, NULL);
+//        pthread_join(consumer_thread, NULL);
+//
+//        // Cleanup FFmpeg resources
+//        avcodec_free_context(&pCodecContext);
+//        avformat_close_input(&pFormatContext);
+//
+//        return 0;
     }
 
     // If it's not a video
@@ -849,7 +1026,7 @@ int main(int argc, char *argv[]) {
         clear_terminal();
 
         // Initial render
-        render_ascii_art_terminal(cached_img, img_width, img_height, term_rows, term_cols, char_set, char_set_size);
+//        render_ascii_art_terminal(cached_img, img_width, img_height, term_rows, term_cols, char_set, char_set_size);
 
         // Set up for resizing
         struct sigaction sa;
@@ -863,7 +1040,7 @@ int main(int argc, char *argv[]) {
         while (true) {
             if (resized) {
                 get_terminal_size(&term_rows, &term_cols);
-                render_ascii_art_terminal(cached_img, img_width, img_height, term_rows, term_cols, char_set, char_set_size);
+//                render_ascii_art_terminal(cached_img, img_width, img_height, term_rows, term_cols, char_set, char_set_size);
                 resized = false;
             }
 
