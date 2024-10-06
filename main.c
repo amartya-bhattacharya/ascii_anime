@@ -25,6 +25,9 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 
+
+volatile bool terminated = false; // Track if the program is being terminated
+
 #define FONT_SIZE 16  // Font size for rendering
 #define FONT_PATH "Topaz-8.ttf" // Path to the Topaz-8 font file
 
@@ -96,6 +99,23 @@ pthread_cond_t buffer_cond = PTHREAD_COND_INITIALIZER;
 volatile bool is_running = true;
 volatile bool is_done = false; // Added to indicate that producer is done
 
+// Profiling variables
+struct timespec producer_start_time, producer_end_time;
+double producer_total_time = 0.0;
+double producer_read_frame_total_time = 0.0;
+double producer_send_packet_total_time = 0.0;
+double producer_receive_frame_total_time = 0.0;
+double producer_convert_frame_total_time = 0.0;
+double producer_cache_total_time = 0.0;
+int producer_frame_count = 0;
+
+struct timespec consumer_start_time, consumer_end_time;
+double consumer_total_time = 0.0;
+double consumer_lock_wait_total = 0.0;
+double consumer_render_total = 0.0;
+double consumer_buffer_update_total = 0.0;
+int consumer_frame_count = 0;
+
 // Function to get a formatted timestamp
 void print_timestamp(const char *message) {
     struct timeval tv;
@@ -118,7 +138,7 @@ int init_font(const char *font_path) {
     return 0;
 }
 
-int initialize_ffmpeg(const char *filename, AVFormatContext **pFormatContext, AVCodecContext **pCodecContext, int *video_stream_index) {
+int init_ffmpeg(const char *filename, AVFormatContext **pFormatContext, AVCodecContext **pCodecContext, int *video_stream_index) {
     // Initialize FFmpeg and open the input video file
     avformat_network_init();
     print_timestamp("Initializing FFmpeg...");
@@ -274,44 +294,8 @@ void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_h
     printf("\nOriginal: %dx%d (AR: %.2f) | New: %dx%d (AR: %.2f) | Term: %dx%d",
                img_width, img_height, original_ar, target_width, target_height, new_ar, term_cols, term_rows + debug_lines);
 
-    fflush(stdout);
+//    fflush(stdout);   // might have to put this back and pass in the fps stuff in params for image
 }
-
-
-// Optimized terminal rendering to avoid full clears
-//void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_height, int term_rows, int term_cols, const char *char_set, int char_set_size) {
-//    float char_aspect_ratio = 2.0;
-//    term_rows -= debug_lines;
-//    float img_aspect_ratio = (float)img_width / img_height;
-//
-//    int target_width = term_cols;
-//    int target_height = target_width / img_aspect_ratio / char_aspect_ratio;
-//    if (target_height > term_rows) {
-//        target_height = term_rows;
-//        target_width = target_height * img_aspect_ratio * char_aspect_ratio;
-//    }
-//
-//    printf("\033[H");  // Move cursor to the top
-//    for (int y = 0; y < target_height; y++) {
-//        for (int x = 0; x < target_width; x++) {
-//            int img_x = x * img_width / target_width;
-//            int img_y = y * img_height / target_height;
-//
-//            CachedPixel pixel = cached_img[img_y * img_width + img_x];
-//            int gray = pixel.gray_value;
-//            char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
-//            print_colored_char(ascii_char, pixel.r, pixel.g, pixel.b);
-//        }
-//        printf("\033[0m\n");
-//    }
-//
-//    // Print debugging information (aspect ratios)
-//    float original_ar = (float)img_width / img_height;
-//    float new_ar = (float)target_width / target_height;
-//    printf("\nOriginal: %dx%d (AR: %.2f) | New: %dx%d (AR: %.2f)\n", img_width, img_height, original_ar, target_width, target_height, new_ar);
-//    fflush(stdout);
-//}
-
 
 // Helper function to render ASCII characters using stb_truetype
 void render_ascii_to_image(unsigned char *output_img, int x, int y, char ascii_char, int img_width, int img_height, int r, int g, int b) {
@@ -458,7 +442,7 @@ void *frame_producer(void *args) {
     struct SwsContext *sws_ctx = sws_getContext(
         pCodecContext->width, pCodecContext->height, pCodecContext->pix_fmt,
         pCodecContext->width, pCodecContext->height, AV_PIX_FMT_RGB24,
-        SWS_BILINEAR, NULL, NULL, NULL
+        SWS_FAST_BILINEAR, NULL, NULL, NULL
     );
 
     if (!sws_ctx) {
@@ -484,8 +468,30 @@ void *frame_producer(void *args) {
     int pool_index = 0; // Index for using frames and buffers from the pool
     int current_buffer = 0; // 0 for Buffer A, 1 for Buffer B
 
-    while (is_running) {
+    // Granular profiling
+    struct timespec read_frame_start, read_frame_end;
+    struct timespec send_packet_start, send_packet_end;
+    struct timespec receive_frame_start, receive_frame_end;
+    struct timespec convert_frame_start, convert_frame_end;
+    struct timespec cache_start, cache_end;
+
+    double read_frame_total_time = 0.0;
+    double send_packet_total_time = 0.0;
+    double receive_frame_total_time = 0.0;
+    double convert_frame_total_time = 0.0;
+    double cache_total_time = 0.0;
+
+
+    while (is_running && !terminated) {
+        clock_gettime(CLOCK_MONOTONIC, &producer_start_time);  // Start profiling
+
+        clock_gettime(CLOCK_MONOTONIC, &read_frame_start);
+
         int ret = av_read_frame(pFormatContext, packet);
+
+        clock_gettime(CLOCK_MONOTONIC, &read_frame_end);
+        read_frame_total_time += (read_frame_end.tv_sec - read_frame_start.tv_sec) + (read_frame_end.tv_nsec - read_frame_start.tv_nsec) / 1e9;
+
         if (ret < 0) {
             if (ret == AVERROR_EOF) {
                 // End of file reached, no more packets to read
@@ -497,7 +503,13 @@ void *frame_producer(void *args) {
         }
 
         if (packet->stream_index == video_stream_index) {
+            clock_gettime(CLOCK_MONOTONIC, &send_packet_start);
+
             ret = avcodec_send_packet(pCodecContext, packet);
+
+            clock_gettime(CLOCK_MONOTONIC, &send_packet_end);
+            send_packet_total_time += (send_packet_end.tv_sec - send_packet_start.tv_sec) + (send_packet_end.tv_nsec - send_packet_start.tv_nsec) / 1e9;
+
             if (ret < 0) {
                 fprintf(stderr, "Error sending packet to decoder: %s\n", av_err2str(ret));
                 av_packet_unref(packet);
@@ -505,13 +517,20 @@ void *frame_producer(void *args) {
             }
 
             while ((ret = avcodec_receive_frame(pCodecContext, frame)) == 0) {
+                clock_gettime(CLOCK_MONOTONIC, &receive_frame_start);
+
                 // Use pre-allocated RGB frame from the pool
                 AVFrame *rgb_frame = frame_pool[pool_index];
                 uint8_t *buffer = buffer_pool[pool_index];
 
                 // Convert the frame to RGB
+                clock_gettime(CLOCK_MONOTONIC, &convert_frame_start);
+
                 av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer, AV_PIX_FMT_RGB24, pCodecContext->width, pCodecContext->height, 32);
                 sws_scale(sws_ctx, (uint8_t const * const *)frame->data, frame->linesize, 0, pCodecContext->height, rgb_frame->data, rgb_frame->linesize);
+
+                clock_gettime(CLOCK_MONOTONIC, &convert_frame_end);
+                convert_frame_total_time += (convert_frame_end.tv_sec - convert_frame_start.tv_sec) + (convert_frame_end.tv_nsec - convert_frame_start.tv_nsec) / 1e9;
 
                 // Lock the buffer and write frame to it
                 pthread_mutex_lock(&buffer_mutex);
@@ -521,8 +540,13 @@ void *frame_producer(void *args) {
                 }
 
                 // Cache grayscale values
+                clock_gettime(CLOCK_MONOTONIC, &cache_start);
+
                 frame_buffer[current_buffer][buffer_write_index].cached_img = cached_image_pool[pool_index];
                 cache_grayscale_values(rgb_frame->data[0], pCodecContext->width, pCodecContext->height, frame_buffer[current_buffer][buffer_write_index].cached_img);
+
+                clock_gettime(CLOCK_MONOTONIC, &cache_end);
+                cache_total_time += (cache_end.tv_sec - cache_start.tv_sec) + (cache_end.tv_nsec - cache_start.tv_nsec) / 1e9;
 
                 frame_buffer[current_buffer][buffer_write_index].frame = frame_pool[pool_index];
                 frame_buffer[current_buffer][buffer_write_index].is_ready = 1;
@@ -538,6 +562,10 @@ void *frame_producer(void *args) {
                 pthread_mutex_unlock(&buffer_mutex);
 
                 pool_index = (pool_index + 1) % BUFFER_POOL_SIZE;
+
+                clock_gettime(CLOCK_MONOTONIC, &receive_frame_end);
+                receive_frame_total_time += (receive_frame_end.tv_sec - receive_frame_start.tv_sec) + (receive_frame_end.tv_nsec - receive_frame_start.tv_nsec) / 1e9;
+
             }
 
             if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
@@ -545,6 +573,10 @@ void *frame_producer(void *args) {
             }
         }
         av_packet_unref(packet);
+
+        clock_gettime(CLOCK_MONOTONIC, &producer_end_time);  // End profiling
+        producer_total_time += (producer_end_time.tv_sec - producer_start_time.tv_sec) + (producer_end_time.tv_nsec - producer_start_time.tv_nsec) / 1e9;
+        producer_frame_count++;
     }
 
     pthread_mutex_lock(&buffer_mutex);
@@ -555,6 +587,13 @@ void *frame_producer(void *args) {
     av_frame_free(&frame);
     av_packet_free(&packet);
     sws_freeContext(sws_ctx);
+
+    // Store granular profiling results
+    producer_read_frame_total_time = read_frame_total_time;
+    producer_send_packet_total_time = send_packet_total_time;
+    producer_receive_frame_total_time = receive_frame_total_time;
+    producer_convert_frame_total_time = convert_frame_total_time;
+    producer_cache_total_time = cache_total_time;
 
     pthread_exit(NULL);
 }
@@ -570,12 +609,22 @@ void *frame_consumer(void *args) {
     int frame_count = 0;
     const int fps_calculation_window = 10;  // Calculate FPS every 10 frames
 
+    // Profiling variables for different consumer stages
+    double lock_wait_total = 0.0;
+    double render_total = 0.0;
+    double buffer_update_total = 0.0;
+
     // Start time for FPS calculation
     clock_gettime(CLOCK_MONOTONIC, &previous_time);
 
     int current_buffer = 0; // 0 for Buffer A, 1 for Buffer B
 
-    while (is_running) {
+    while (is_running && !terminated) {
+        struct timespec stage_start, stage_end;
+
+        // Stage 1: Lock and wait for frame availability
+        clock_gettime(CLOCK_MONOTONIC, &stage_start);
+
         pthread_mutex_lock(&buffer_mutex);
 
         // Wait until there's a frame ready to consume or the producer signals completion
@@ -589,8 +638,27 @@ void *frame_consumer(void *args) {
             break;
         }
 
+        clock_gettime(CLOCK_MONOTONIC, &stage_end);
+        lock_wait_total += (stage_end.tv_sec - stage_start.tv_sec) + (stage_end.tv_nsec - stage_start.tv_nsec) / 1e9;
+
+        // Stage 2: Render the frame
+        clock_gettime(CLOCK_MONOTONIC, &stage_start);
+
         // Consume the frame
         CachedPixel *cached_img = frame_buffer[current_buffer][buffer_read_index].cached_img;
+
+        // Render the frame to the terminal
+        int term_rows, term_cols;
+        get_terminal_size(&term_rows, &term_cols);
+
+        render_ascii_art_terminal(cached_img, pCodecContext_width, pCodecContext_height, term_rows, term_cols,
+                                  ASCII_CHARS_DEFAULT, ascii_map_size_default);
+
+        clock_gettime(CLOCK_MONOTONIC, &stage_end);
+        render_total += (stage_end.tv_sec - stage_start.tv_sec) + (stage_end.tv_nsec - stage_start.tv_nsec) / 1e9;
+
+        // Stage 3: Update buffer indices
+        clock_gettime(CLOCK_MONOTONIC, &stage_start);
 
         // Mark frame as consumed and update the read index
         frame_buffer[current_buffer][buffer_read_index].is_ready = 0;
@@ -604,12 +672,8 @@ void *frame_consumer(void *args) {
         pthread_cond_signal(&buffer_cond);
         pthread_mutex_unlock(&buffer_mutex);
 
-        // Render the frame to the terminal
-        int term_rows, term_cols;
-        get_terminal_size(&term_rows, &term_cols);
-
-        render_ascii_art_terminal(cached_img, pCodecContext_width, pCodecContext_height, term_rows, term_cols,
-                                  ASCII_CHARS_DEFAULT, ascii_map_size_default);
+        clock_gettime(CLOCK_MONOTONIC, &stage_end);
+        buffer_update_total += (stage_end.tv_sec - stage_start.tv_sec) + (stage_end.tv_nsec - stage_start.tv_nsec) / 1e9;
 
         // End time for FPS calculation
         clock_gettime(CLOCK_MONOTONIC, &current_time);
@@ -621,6 +685,9 @@ void *frame_consumer(void *args) {
         // Accumulate total elapsed time and count frames
         total_elapsed_time += frame_elapsed_time;
         frame_count++;
+
+        // Profiling
+        consumer_frame_count++;
 
         // Every `fps_calculation_window` frames, calculate and display FPS
         if (frame_count % fps_calculation_window == 0) {
@@ -636,7 +703,59 @@ void *frame_consumer(void *args) {
         }
     }
 
-    return NULL;
+    // Update global profiling variables for consumer stages
+    consumer_lock_wait_total += lock_wait_total;
+    consumer_render_total += render_total;
+    consumer_buffer_update_total += buffer_update_total;
+
+    pthread_exit(NULL);
+}
+
+
+
+void print_profiling_results() {
+    if (producer_frame_count > 0) {
+        printf("Average Producer Time per Frame: %.6f seconds\n", producer_total_time / producer_frame_count);
+        printf("Producer Profiling Breakdown:\n");
+        printf(" - Average Read Frame Time per Frame: %.6f seconds\n", producer_read_frame_total_time / producer_frame_count);
+        printf(" - Average Send Packet Time per Frame: %.6f seconds\n", producer_send_packet_total_time / producer_frame_count);
+        printf(" - Average Receive Frame Time per Frame: %.6f seconds\n", producer_receive_frame_total_time / producer_frame_count);
+        printf(" - Average Convert Frame Time per Frame: %.6f seconds\n", producer_convert_frame_total_time / producer_frame_count);
+        printf(" - Average Cache Time per Frame: %.6f seconds\n", producer_cache_total_time / producer_frame_count);
+    } else {
+        printf("No frames produced.\n");
+    }
+
+    if (consumer_frame_count > 0) {
+        printf("Average Consumer Time per Frame: %.6f seconds\n", consumer_total_time / consumer_frame_count);
+        printf("Consumer Profiling Breakdown:\n");
+        printf(" - Average Lock & Wait Time per Frame: %.6f seconds\n", consumer_lock_wait_total / consumer_frame_count);
+        printf(" - Average Render Time per Frame: %.6f seconds\n", consumer_render_total / consumer_frame_count);
+        printf(" - Average Buffer Update Time per Frame: %.6f seconds\n", consumer_buffer_update_total / consumer_frame_count);
+    } else {
+        printf("No frames consumed.\n");
+    }
+}
+
+// Signal handler function
+void handle_sigint(int sig) {
+    (void)sig;  // Suppress unused parameter warning
+    terminated = true;
+    print_profiling_results();  // Print whatever profiling data we have so far
+    // Optionally add a clean exit here if needed
+    exit(0);
+}
+
+void setup_signal_handler() {
+    struct sigaction sa;
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        perror("Error setting up SIGINT handler");
+        exit(1);
+    }
 }
 
 void process_video(const char *filename) {
@@ -645,7 +764,7 @@ void process_video(const char *filename) {
     int video_stream_index = -1;
 
     // Initialize FFmpeg and open the input video file
-    if (initialize_ffmpeg(filename, &pFormatContext, &pCodecContext, &video_stream_index) != 0) {
+    if (init_ffmpeg(filename, &pFormatContext, &pCodecContext, &video_stream_index) != 0) {
         // Initialization failed, exit the function
         return;
     }
@@ -658,6 +777,7 @@ void process_video(const char *filename) {
     double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
     double frame_delay = 1000.0 / fps;
 
+    clear_terminal();
     printf("Video Extension: %s\n", extension);
     printf("Target FPS: %.2f\n", fps);
     printf("Frame Time (ms): %.2f\n", frame_delay);
@@ -711,6 +831,9 @@ void process_video(const char *filename) {
     // Wait for producer and consumer threads to finish
     pthread_join(producer_thread, NULL);
     pthread_join(consumer_thread, NULL);
+
+    // Print profiling results after both threads finish
+    print_profiling_results();
 
     // Cleanup FFmpeg resources
     avcodec_free_context(&pCodecContext);
@@ -783,6 +906,7 @@ int is_video_file(const char *filename) {
 }
 
 int main(int argc, char *argv[]) {
+    setup_signal_handler();
     CachedPixel *cached_img = NULL;
     unsigned char *img = NULL;
 
