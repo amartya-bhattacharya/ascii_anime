@@ -12,25 +12,20 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavcodec
     libavutil
     libswscale
-    libavdevice
 )
-
-# Include FFmpeg directories
-include_directories(${FFMPEG_INCLUDE_DIRS})
 
 # Add the executable target
-add_executable(anime_to_ascii main.c)
+add_executable(anime_to_ascii src/main.c)
 
-# Link FFmpeg libraries to the target
-target_link_libraries(anime_to_ascii
-    PkgConfig::FFMPEG
-)
+# Include FFmpeg headers and link libraries
+target_include_directories(anime_to_ascii PRIVATE ${FFMPEG_INCLUDE_DIRS})
+target_link_libraries(anime_to_ascii PRIVATE PkgConfig::FFMPEG)
 
 # Set rpath to locate FFmpeg libraries at runtime (useful on Unix systems)
 set_target_properties(anime_to_ascii PROPERTIES
-    INSTALL_RPATH "/usr/local/lib"
-    BUILD_RPATH "/usr/local/lib"
+    INSTALL_RPATH "${FFMPEG_LIBRARY_DIRS}"
+    BUILD_RPATH "${FFMPEG_LIBRARY_DIRS}"
 )
 
-# Set additional compiler flags if necessary for FFmpeg or other dependencies
+# Compiler flags (more resilient for older versions of FFmpeg)
 target_compile_options(anime_to_ascii PRIVATE ${FFMPEG_CFLAGS_OTHER})
