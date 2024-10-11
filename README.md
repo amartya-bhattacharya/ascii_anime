@@ -1,6 +1,6 @@
 # ASCII Image Generator Demo
 
-This project converts images (and videos) into ASCII art! Options for default or extended ASCII set. block chars WIP.
+Watch anime in your terminal! Options for default or extended ASCII set. block chars WIP.
 Options to render directly to terminal, or output to a png/txt file. Output saved as `<input>-ascii.png/.txt`.
 
 ### Dependencies
@@ -32,6 +32,7 @@ Rendering options:
 
 Output options:
 - Live render to terminal
+  - Video support up to 1080p 60fps, or 4k 30fps 
 - Save to a PNG file
   - Upscale or downscale the image
 - Save to a TXT file
