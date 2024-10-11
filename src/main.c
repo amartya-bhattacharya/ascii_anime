@@ -4,7 +4,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <signal.h>
@@ -15,7 +14,6 @@
 #include <sys/time.h>
 #include <sys/select.h>
 #include <pthread.h>
-//#include <omp.h>
 #include "../include/stb/stb_image.h"
 #include "../include/stb/stb_image_write.h"
 #include "../include/stb/stb_truetype.h"
@@ -55,7 +53,7 @@ const char *BLOCK_CHARS = "▁▂▃▄▅▆▇█";
 int block_map_size = 8;
 
 // Constants for buffering
-#define BUFFER_POOL_SIZE 15
+#define BUFFER_POOL_SIZE 32
 
 #define NUM_PRODUCERS 1
 
@@ -154,7 +152,6 @@ int init_font(const char *font_path) {
 int init_ffmpeg(const char *filename, AVFormatContext **pFormatContext, AVCodecContext **pCodecContext, int *video_stream_index) {
     // Initialize FFmpeg and open the input video file
     avformat_network_init();
-    print_timestamp("Initializing FFmpeg...");
 
     if (avformat_open_input(pFormatContext, filename, NULL, NULL) != 0) {
         fprintf(stderr, "Could not open video file: %s\n", filename);
@@ -168,9 +165,9 @@ int init_ffmpeg(const char *filename, AVFormatContext **pFormatContext, AVCodecC
     }
 
     // Find the video stream
-    for (int i = 0; i < (*pFormatContext)->nb_streams; i++) {
+    for (unsigned int i = 0; i < (*pFormatContext)->nb_streams; i++) {
         if ((*pFormatContext)->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            *video_stream_index = i;
+            *video_stream_index = (int)i;
             break;
         }
     }
@@ -182,7 +179,7 @@ int init_ffmpeg(const char *filename, AVFormatContext **pFormatContext, AVCodecC
     }
 
     // Find and set up the codec context
-    AVCodecParameters *codec_params = (*pFormatContext)->streams[*video_stream_index]->codecpar;
+    const AVCodecParameters *codec_params = (*pFormatContext)->streams[*video_stream_index]->codecpar;
     const AVCodec *codec = avcodec_find_decoder(codec_params->codec_id);
     if (!codec) {
         fprintf(stderr, "Failed to find codec.\n");
@@ -204,11 +201,39 @@ int init_ffmpeg(const char *filename, AVFormatContext **pFormatContext, AVCodecC
         return -1;
     }
 
+    // Enable hardware acceleration (VideoToolbox for macOS)
+    int using_hw_accel = 0;
+    if (codec_params->codec_id == AV_CODEC_ID_H264 || codec_params->codec_id == AV_CODEC_ID_HEVC) {
+        const AVCodec *hw_codec = avcodec_find_decoder_by_name("h264_videotoolbox");
+        if (hw_codec) {
+            avcodec_free_context(pCodecContext); // Free the previous context
+            *pCodecContext = avcodec_alloc_context3(hw_codec);
+
+            if (avcodec_parameters_to_context(*pCodecContext, codec_params) < 0) {
+                fprintf(stderr, "Failed to copy codec parameters to context.\n");
+                avcodec_free_context(pCodecContext);
+                avformat_close_input(pFormatContext);
+                return -1;
+            } else {
+                using_hw_accel = 1; // Set the flag indicating that HW acceleration is being used
+            }
+        } else {
+            fprintf(stderr, "Failed to find hardware-accelerated codec.\n");
+        }
+    }
+
     if (avcodec_open2(*pCodecContext, codec, NULL) < 0) {
         fprintf(stderr, "Failed to open codec.\n");
         avcodec_free_context(pCodecContext);
         avformat_close_input(pFormatContext);
         return -1;
+    }
+
+    // Print whether hardware acceleration is being used and the codec name
+    if (using_hw_accel) {
+        printf("Using hardware acceleration: %s\n", (*pCodecContext)->codec->name);
+    } else {
+        printf("Using software decoding: %s\n", (*pCodecContext)->codec->name);
     }
 
     return 0;  // Successful initialization
@@ -218,7 +243,7 @@ static volatile bool resized = false;
 const int debug_lines = 2;  // Number of lines to print after image
 
 // Function to handle terminal resize events
-void handle_resize(int sig) {
+void handle_resize(const int sig) {
     (void)sig;  // Mark the parameter as unused to suppress the warning
     resized = true;  // Set a flag to indicate the terminal has resized
 }
@@ -232,7 +257,7 @@ void get_terminal_size(int *rows, int *cols) {
 }
 
 // Function to print colored ASCII characters with a black background
-static inline void print_colored_char(char ascii_char, int r, int g, int b) {
+static void print_colored_char(const char ascii_char, const int r, const int g, const int b) {
     printf("\033[48;2;0;0;0m\033[38;2;%d;%d;%dm%c", r, g, b, ascii_char);
 }
 
@@ -290,14 +315,13 @@ void print_profiling_results() {
 }
 
 // Function to initialize the cached pixel array
-void cache_grayscale_values(const unsigned char *img, int img_width, int img_height, CachedPixel *cached_img) {
-    #pragma omp parallel for
+void cache_grayscale_values(const unsigned char *img, const int img_width, const int img_height, CachedPixel *cached_img) {
     for (int y = 0; y < img_height; y++) {
         for (int x = 0; x < img_width; x++) {
-            int index = (y * img_width + x) * 3;
-            int r = img[index];
-            int g = img[index + 1];
-            int b = img[index + 2];
+            const int index = (y * img_width + x) * 3;
+            const int r = img[index];
+            const int g = img[index + 1];
+            const int b = img[index + 2];
 
             cached_img[y * img_width + x].r = r;
             cached_img[y * img_width + x].g = g;
@@ -307,17 +331,13 @@ void cache_grayscale_values(const unsigned char *img, int img_width, int img_hei
     }
 }
 
-
 // Modify print function to move cursor back to the beginning instead of clearing
 void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_height, int term_rows, int term_cols, const char *char_set, int char_set_size, DebugInfo *debug_info) {
-    static double total_render_time = 0.0;
-    static int frame_count = 0;
-
-    float char_aspect_ratio = 2.0;
+    const float char_aspect_ratio = 2.0;
 
     // Precompute scaled dimensions once and reuse in loops
     term_rows -= debug_lines;
-    float img_aspect_ratio = (float)img_width / img_height;
+    const float img_aspect_ratio = (float)img_width / img_height;
 
     int target_width = term_cols;
     int target_height = target_width / img_aspect_ratio / char_aspect_ratio;
@@ -332,19 +352,18 @@ void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_h
     // Clear terminal and move the cursor to the top before every render
     printf("\033[H");
     printf("\0337");  // Save cursor position
-//    printf("\033[2J\033[H");  // Clear terminal and move the cursor to the top
 
     // Use the precomputed grayscale value from CachedPixel
     for (int y = 0; y < target_height; y++) {
         for (int x = 0; x < target_width; x++) {
-            int img_x = x * img_width / target_width;
-            int img_y = y * img_height / target_height;
+            const int img_x = x * img_width / target_width;
+            const int img_y = y * img_height / target_height;
 
             CachedPixel pixel = cached_img[img_y * img_width + img_x];
 
             // Use precomputed grayscale value instead of calling get_ascii_char
-            int gray = pixel.gray_value;
-            char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
+            const int gray = pixel.gray_value;
+            const char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
             print_colored_char(ascii_char, pixel.r, pixel.g, pixel.b);
         }
         printf("\033[0m\n");  // Reset color after each line
@@ -368,15 +387,15 @@ void render_ascii_art_terminal(CachedPixel *cached_img, int img_width, int img_h
 // Helper function to render ASCII characters using stb_truetype
 void render_ascii_to_image(unsigned char *output_img, int x, int y, char ascii_char, int img_width, int img_height, int r, int g, int b) {
     int width, height, x_offset, y_offset;
-    float scale_factor = stbtt_ScaleForPixelHeight(&font, FONT_SIZE);
+    const float scale_factor = stbtt_ScaleForPixelHeight(&font, FONT_SIZE);
     unsigned char *bitmap = stbtt_GetCodepointBitmap(&font, 0, scale_factor, ascii_char, &width, &height, &x_offset, &y_offset);
 
     // Render the ASCII character with the foreground color (r, g, b) on a black background
     for (int i = 0; i < height; ++i) {
         for (int j = 0; j < width; ++j) {
-            int output_x = x + j;
-            int output_y = y + i;
-            int output_index = (output_y * img_width + output_x) * 4;
+            const int output_x = x + j;
+            const int output_y = y + i;
+            const int output_index = (output_y * img_width + output_x) * 4;
 
             // Check for out-of-bounds writes (improved for both width and height)
             if (output_x >= 0 && output_x < img_width && output_y >= 0 && output_y < img_height) {
@@ -401,12 +420,12 @@ void render_ascii_art_file_scaled(CachedPixel *cached_img, int img_width, int im
     }
 
     // Precompute scaled dimensions once and reuse in loops
-    int scaled_width = (int)(img_width * scale_factor);
-    int scaled_height = (int)(img_height * scale_factor);
+    const int scaled_width = (int)(img_width * scale_factor);
+    const int scaled_height = (int)(img_height * scale_factor);
 
     // Allocate memory for the output image (RGBA)
-    size_t output_size = scaled_width * scaled_height * 4;
-    unsigned char *output_img = (unsigned char *)malloc(output_size);
+    const size_t output_size = scaled_width * scaled_height * 4;
+    unsigned char *output_img = malloc(output_size);
     if (!output_img) {
         printf("Failed to allocate memory for output image.\n");
         return;
@@ -434,10 +453,10 @@ void render_ascii_art_file_scaled(CachedPixel *cached_img, int img_width, int im
                 int b = pixel.b;
 
                 // Use precomputed grayscale value from CachedPixel
-                int gray = pixel.gray_value;
+                const int gray = pixel.gray_value;
 
                 // Render the ASCII character at the correct position
-                char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
+                const char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
                 if (ascii_char != ' ') {
                     render_ascii_to_image(output_img, x, y, ascii_char, scaled_width, scaled_height, r, g, b);
                 }
@@ -458,11 +477,11 @@ void render_ascii_art_file_txt(CachedPixel *cached_img, int img_width, int img_h
         return;
     }
 
-    float char_aspect_ratio = 2.0;
+    const float char_aspect_ratio = 2.0;
 
     // Adjust terminal height to account for debug information
     term_rows -= debug_lines;
-    float img_aspect_ratio = (float)img_width / img_height;
+    const float img_aspect_ratio = (float)img_width / img_height;
 
     int target_width = term_cols;
     int target_height = target_width / img_aspect_ratio / char_aspect_ratio;
@@ -487,8 +506,8 @@ void render_ascii_art_file_txt(CachedPixel *cached_img, int img_width, int img_h
             CachedPixel pixel = cached_img[img_y * img_width + img_x];
 
             // Use precomputed grayscale value from CachedPixel
-            int gray = pixel.gray_value;
-            char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
+            const int gray = pixel.gray_value;
+            const char ascii_char = char_set[(gray * (char_set_size - 1)) / 255];
 
             // Write the ASCII character to the file
             fputc(ascii_char, file);
@@ -501,11 +520,11 @@ void render_ascii_art_file_txt(CachedPixel *cached_img, int img_width, int img_h
 }
 
 void *frame_producer(void *args) {
-    ProducerArgs *prod_args = (ProducerArgs *)args;
+    const ProducerArgs *prod_args = args;
 
     AVFormatContext *pFormatContext = prod_args->pFormatContext;
     AVCodecContext *pCodecContext = prod_args->pCodecContext;
-    int video_stream_index = prod_args->video_stream_index;
+    const int video_stream_index = prod_args->video_stream_index;
 
     struct SwsContext *sws_ctx = sws_getContext(
         pCodecContext->width, pCodecContext->height, pCodecContext->pix_fmt,
@@ -688,22 +707,21 @@ void *frame_producer(void *args) {
 
 // Consumer thread function: Renders frames to terminal
 void *frame_consumer(void *args) {
-    ConsumerArgs *cons_args = (ConsumerArgs *)args;
-    int pCodecContext_width = cons_args->pCodecContext_width;
-    int pCodecContext_height = cons_args->pCodecContext_height;
+    const ConsumerArgs *cons_args = args;
+    const int pCodecContext_width = cons_args->pCodecContext_width;
+    const int pCodecContext_height = cons_args->pCodecContext_height;
+    const double fps = cons_args->fps;    // Target frame rate
 
-    struct timespec previous_time, current_time;
-    double total_elapsed_time = 0.0;
-    int frame_count = 0;
-    const int fps_calculation_window = 10;  // Calculate FPS every 10 frames
+    // Calculate frame delay
+    const double frame_delay = 1.0 / fps;
+
+    struct timespec previous_time, current_time, frame_end_time;
+    DebugInfo debug_info;
 
     // Profiling variables for different consumer stages
     double lock_wait_total = 0.0;
     double render_total = 0.0;
     double buffer_update_total = 0.0;
-
-    // Start time for FPS calculation
-    clock_gettime(CLOCK_MONOTONIC, &previous_time);
 
     int current_buffer = 0; // 0 for Buffer A, 1 for Buffer B
 
@@ -712,6 +730,10 @@ void *frame_consumer(void *args) {
     clear_terminal();
 
     set_nonblocking_input();  // Set terminal input to non-blocking
+
+    // Start time for FPS calculation
+    clock_gettime(CLOCK_MONOTONIC, &previous_time);
+    struct timespec target_time = previous_time;
 
     while (is_running && !terminated) {
         struct timespec stage_start, stage_end;
@@ -748,21 +770,6 @@ void *frame_consumer(void *args) {
         // Consume the frame
         CachedPixel *cached_img = frame_buffer[current_buffer][buffer_read_index].cached_img;
 
-        DebugInfo debug_info = {0};
-
-        if (frame_count % fps_calculation_window == 0 && frame_count > 0) {
-            // Calculate FPS only if we have enough frames and avoid division by zero
-            double avg_fps = fps_calculation_window / (total_elapsed_time + 1e-9);  // Add a small epsilon to avoid zero
-            double avg_frame_delay = (total_elapsed_time / fps_calculation_window) * 1000.0;  // in milliseconds
-
-            debug_info.has_fps_info = true;
-            debug_info.avg_fps = avg_fps;
-            debug_info.avg_frame_delay = avg_frame_delay;
-
-            // Reset for the next calculation window
-            total_elapsed_time = 0.0;
-        }
-
         // Render the frame to the terminal
         render_ascii_art_terminal(cached_img, pCodecContext_width, pCodecContext_height, term_rows, term_cols,
                                   ASCII_CHARS_DEFAULT, ascii_map_size_default, &debug_info);
@@ -788,18 +795,43 @@ void *frame_consumer(void *args) {
         clock_gettime(CLOCK_MONOTONIC, &stage_end);
         buffer_update_total += (stage_end.tv_sec - stage_start.tv_sec) + (stage_end.tv_nsec - stage_start.tv_nsec) / 1e9;
 
-        // End time for FPS calculation
-        clock_gettime(CLOCK_MONOTONIC, &current_time);
-        double frame_elapsed_time =
-                (current_time.tv_sec - previous_time.tv_sec) + (current_time.tv_nsec - previous_time.tv_nsec) / 1e9;
+        // Calculate the target time for the next frame
+        target_time.tv_sec += (int)frame_delay;
+        target_time.tv_nsec += (frame_delay - (int)frame_delay) * 1e9;
 
-        // Only accumulate frame_elapsed_time if it's greater than zero to avoid division issues
-        if (frame_elapsed_time > 0) {
-            total_elapsed_time += frame_elapsed_time;
-            frame_count++;
+        // Normalize in case tv_nsec exceeds 1 second
+        if (target_time.tv_nsec >= 1e9) {
+            target_time.tv_sec += 1;
+            target_time.tv_nsec -= 1e9;
         }
 
-        previous_time = current_time;
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+
+        // Calculate time difference between target time and current time
+        double time_to_sleep = (target_time.tv_sec - current_time.tv_sec) +
+                               (target_time.tv_nsec - current_time.tv_nsec) / 1e9;
+
+        // Sleep if we are ahead of schedule
+        if (time_to_sleep > 0) {
+            struct timespec sleep_duration;
+            sleep_duration.tv_sec = (time_t)time_to_sleep;
+            sleep_duration.tv_nsec = (time_to_sleep - sleep_duration.tv_sec) * 1e9;
+            nanosleep(&sleep_duration, NULL);
+        }
+
+        // Get the current time after sleep/render
+        clock_gettime(CLOCK_MONOTONIC, &frame_end_time);
+        const double frame_elapsed_time = (frame_end_time.tv_sec - previous_time.tv_sec) +
+                                          (frame_end_time.tv_nsec - previous_time.tv_nsec) / 1e9;
+
+        previous_time = frame_end_time;
+
+        const double avg_fps = 1.0 / frame_elapsed_time;  // Calculate FPS (add a small epsilon to avoid division by zero)
+        const double avg_frame_delay = frame_elapsed_time * 1000.0;  // in milliseconds
+
+        debug_info.has_fps_info = true;
+        debug_info.avg_fps = avg_fps;
+        debug_info.avg_frame_delay = avg_frame_delay;
 
         // Profiling
         consumer_frame_count++;
@@ -912,6 +944,8 @@ void process_video(const char *filename) {
     AVCodecContext *pCodecContext = NULL;
     int video_stream_index = -1;
 
+    clear_terminal();
+
     // Initialize FFmpeg and open the input video file
     if (init_ffmpeg(filename, &pFormatContext, &pCodecContext, &video_stream_index) != 0) {
         // Initialization failed, exit the function
@@ -923,10 +957,9 @@ void process_video(const char *filename) {
     if (!extension) extension = "unknown";
 
     // Prepare render context for video
-    double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
-    double frame_delay = 1000.0 / fps;
+    const double fps = av_q2d(pFormatContext->streams[video_stream_index]->r_frame_rate);
+    const double frame_delay = 1000.0 / fps;
 
-    clear_terminal();
     printf("Video Extension: %s\n", extension);
     printf("Target FPS: %.2f\n", fps);
     printf("Frame Time (ms): %.2f\n", frame_delay);
@@ -952,6 +985,10 @@ void process_video(const char *filename) {
             fprintf(stderr, "Failed to copy codec parameters for producer %d\n", i);
             exit(1);
         }
+
+        // Set threading parameters for each producer
+        producer_args[i].pCodecContext->thread_count = sysconf(_SC_NPROCESSORS_ONLN);
+        producer_args[i].pCodecContext->thread_type = FF_THREAD_FRAME;
 
         if (avcodec_open2(producer_args[i].pCodecContext, pCodecContext->codec, NULL) < 0) {
             fprintf(stderr, "Failed to open codec for producer %d\n", i);
@@ -996,6 +1033,8 @@ void process_video(const char *filename) {
         }
     }
 
+    usleep(2000000);
+
     // Create consumer thread
     pthread_create(&consumer_thread, NULL, frame_consumer, &consumer_args);
 
@@ -1024,11 +1063,11 @@ void generate_output_filename(const char *input_filename, char *output_filename,
     const char *last_slash = strrchr(input_filename, '/');
 
     // Calculate the length of the directory path if it exists
-    int dir_length = last_slash ? (last_slash - input_filename) + 1 : 0;
+    const int dir_length = last_slash ? (last_slash - input_filename) + 1 : 0;
 
     // Extract the base name without the extension
     const char *base_name = last_slash ? last_slash + 1 : input_filename;
-    int base_length = last_dot ? last_dot - base_name : strlen(base_name);
+    const int base_length = last_dot ? last_dot - base_name : strlen(base_name);
 
     // Determine the appropriate output filename format
     if (scale_factor == 1) {
@@ -1077,7 +1116,7 @@ int is_video_file(const char *filename) {
     return 0; // Not a video file
 }
 
-int main(int argc, char *argv[]) {
+int main(const int argc, char *argv[]) {
     setup_signal_handler();
     CachedPixel *cached_img = NULL;
     unsigned char *img = NULL;
@@ -1220,7 +1259,7 @@ int main(int argc, char *argv[]) {
         print_memory_usage();
     } else if (output_mode == 2) {  // File output mode
         // Profiling
-        clock_t start_time = clock();
+        const clock_t start_time = clock();
 
         // Let user choose scaling factor
         float scale_factor = 1;
@@ -1247,8 +1286,8 @@ int main(int argc, char *argv[]) {
         render_ascii_art_file_scaled(cached_img, img_width, img_height, char_set, char_set_size, output_filename, scale_factor, FONT_SIZE);
 
         // Profiling
-        clock_t end_time = clock();
-        double file_render_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+        const clock_t end_time = clock();
+        const double file_render_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
         printf("File render time: %.2f seconds\n", file_render_time);
         printf("ASCII art saved to file: %s\n", output_filename);
         print_memory_usage();
