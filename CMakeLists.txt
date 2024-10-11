@@ -3,29 +3,36 @@ project(anime_to_ascii C)
 
 set(CMAKE_C_STANDARD 11)
 
-# Find the FFmpeg packages using pkg-config if available
-find_package(PkgConfig REQUIRED)
+# Manually find FFmpeg libraries
+find_library(AVCODEC_LIBRARY avcodec REQUIRED)
+find_library(AVFORMAT_LIBRARY avformat REQUIRED)
+find_library(AVUTIL_LIBRARY avutil REQUIRED)
+find_library(SWSCALE_LIBRARY swscale REQUIRED)
 
-# Find the necessary FFmpeg packages using pkg-config
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat
-    libavcodec
-    libavutil
-    libswscale
-)
+# Manually find FFmpeg includes
+find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h
+    PATHS /usr/local/include /usr/include /opt/homebrew/include
+    REQUIRED)
 
 # Add the executable target
 add_executable(anime_to_ascii src/main.c)
 
-# Include FFmpeg headers and link libraries
-target_include_directories(anime_to_ascii PRIVATE ${FFMPEG_INCLUDE_DIRS})
-target_link_libraries(anime_to_ascii PRIVATE PkgConfig::FFMPEG)
+# Include FFmpeg headers
+target_include_directories(anime_to_ascii PRIVATE ${FFMPEG_INCLUDE_DIR})
+
+# Link FFmpeg libraries
+target_link_libraries(anime_to_ascii PRIVATE
+    ${AVCODEC_LIBRARY}
+    ${AVFORMAT_LIBRARY}
+    ${AVUTIL_LIBRARY}
+    ${SWSCALE_LIBRARY}
+)
 
 # Set rpath to locate FFmpeg libraries at runtime (useful on Unix systems)
 set_target_properties(anime_to_ascii PROPERTIES
-    INSTALL_RPATH "${FFMPEG_LIBRARY_DIRS}"
-    BUILD_RPATH "${FFMPEG_LIBRARY_DIRS}"
+    INSTALL_RPATH "/usr/local/lib;/opt/homebrew/lib"
+    BUILD_RPATH "/usr/local/lib;/opt/homebrew/lib"
 )
 
 # Compiler flags (more resilient for older versions of FFmpeg)
-target_compile_options(anime_to_ascii PRIVATE ${FFMPEG_CFLAGS_OTHER})
+target_compile_options(anime_to_ascii PRIVATE "-Wall" "-Wextra")
