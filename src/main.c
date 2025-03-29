@@ -131,7 +131,7 @@ int consumer_frame_count = 0;
 void print_timestamp(const char *message) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    printf("[%ld.%06d] %s\n", tv.tv_sec, tv.tv_usec, message);
+    printf("[%ld.%06ld] %s\n", tv.tv_sec, tv.tv_usec, message);
     fflush(stdout);
 }
 
@@ -1067,7 +1067,7 @@ void generate_output_filename(const char *input_filename, char *output_filename,
 
     // Extract the base name without the extension
     const char *base_name = last_slash ? last_slash + 1 : input_filename;
-    const int base_length = last_dot ? last_dot - base_name : strlen(base_name);
+    const int base_length = last_dot ? (int)(last_dot - base_name) : (int)(strlen(base_name));
 
     // Determine the appropriate output filename format
     if (scale_factor == 1) {
