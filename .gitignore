@@ -2,6 +2,8 @@ cmake-build-debug
 .DS_Store
 .idea/
 /build/
+/cmake-build-debug/
+/cmake-build-release/
 *.c
 *.exe
 *.log

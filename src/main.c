@@ -26,7 +26,7 @@
 volatile bool terminated = false; // Track if the program is being terminated
 
 #define FONT_SIZE 16  // Font size for rendering
-#define FONT_PATH "fonts/Topaz-8.ttf" // Path to the Topaz-8 font file
+#define FONT_PATH "include/font/Topaz-8.ttf" // Path to the Topaz-8 font file
 
 // stb_truetype font buffer
 unsigned char ttf_buffer[1<<20];
@@ -1274,7 +1274,12 @@ int main(const int argc, char *argv[]) {
         generate_output_filename(filename, output_filename, scale_factor, "png");
 
         // Load the font
-        init_font(FONT_PATH);
+        if (init_font(FONT_PATH) != 0) {
+            fprintf(stderr, "Error: Failed to initialize font at %s\n", FONT_PATH);
+            free(cached_img);
+            stbi_image_free(img);
+            return 1;
+        }
 
         if (scale_factor <= 0) {
             fprintf(stderr, "Error: Invalid scale factor. Must be greater than 0.\n");

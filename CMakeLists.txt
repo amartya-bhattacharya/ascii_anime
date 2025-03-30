@@ -1,38 +1,29 @@
-cmake_minimum_required(VERSION 3.29)
+cmake_minimum_required(VERSION 3.16)
 project(anime_to_ascii C)
 
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Manually find FFmpeg libraries
-find_library(AVCODEC_LIBRARY avcodec REQUIRED)
-find_library(AVFORMAT_LIBRARY avformat REQUIRED)
-find_library(AVUTIL_LIBRARY avutil REQUIRED)
-find_library(SWSCALE_LIBRARY swscale REQUIRED)
+# Find PkgConfig itself
+find_package(PkgConfig REQUIRED)
 
-# Manually find FFmpeg includes
-find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h
-    PATHS /usr/local/include /usr/include /opt/homebrew/include
-    REQUIRED)
+# Find FFmpeg libraries and includes
+pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
+pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
+pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
+pkg_check_modules(SWSCALE REQUIRED IMPORTED_TARGET libswscale)
 
 # Add the executable target
 add_executable(anime_to_ascii src/main.c)
 
-# Include FFmpeg headers
-target_include_directories(anime_to_ascii PRIVATE ${FFMPEG_INCLUDE_DIR})
-
-# Link FFmpeg libraries
+# Link using the imported targets created by pkg_check_modules
 target_link_libraries(anime_to_ascii PRIVATE
-    ${AVCODEC_LIBRARY}
-    ${AVFORMAT_LIBRARY}
-    ${AVUTIL_LIBRARY}
-    ${SWSCALE_LIBRARY}
+        PkgConfig::AVCODEC
+        PkgConfig::AVFORMAT
+        PkgConfig::AVUTIL
+        PkgConfig::SWSCALE
+        m
 )
 
-# Set rpath to locate FFmpeg libraries at runtime (useful on Unix systems)
-set_target_properties(anime_to_ascii PROPERTIES
-    INSTALL_RPATH "/usr/local/lib;/opt/homebrew/lib"
-    BUILD_RPATH "/usr/local/lib;/opt/homebrew/lib"
-)
-
-# Compiler flags (more resilient for older versions of FFmpeg)
+# Compiler flags
 target_compile_options(anime_to_ascii PRIVATE "-Wall" "-Wextra")
